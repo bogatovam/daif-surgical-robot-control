@@ -11,7 +11,7 @@ print(f'Found config files: {all_configs_files_names}')
 config = OmegaConf.create()
 
 for config_file in all_configs_files_names:
-    file_conf = OmegaConf.load('../source/example3.yaml')
+    file_conf = OmegaConf.load(config_file)
     config = OmegaConf.merge(config, file_conf)
 
 print(OmegaConf.to_yaml(config))

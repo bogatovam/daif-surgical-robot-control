@@ -7,3 +7,5 @@ gym
 matplotlib
 tensorboard
 omegaconf
+jupyterlab
+sympy
