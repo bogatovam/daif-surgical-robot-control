@@ -1,9 +1,10 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from stable_baselines3.common.policies import BaseModel
 
 
-class FcModel(nn.Module):
+class FcModel(BaseModel):
 
     def __init__(self, n_inputs, n_outputs, n_hidden=64, lr=1e-3, softmax=False, device='cpu'):
         super(FcModel, self).__init__()
