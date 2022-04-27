@@ -2,9 +2,10 @@ from omegaconf import OmegaConf
 from os import listdir
 from os.path import isfile, join
 
-configs_files_path = './resources'
+configs_files_path = 'D:/2022/thesis/docs/src/daif-surgical-robot-control/config/resources'
 
-all_configs_files_names = [f for f in listdir(configs_files_path) if isfile(join(configs_files_path, f))]
+all_configs_files_names = [join(configs_files_path, f) for f in listdir(configs_files_path) if
+                           isfile(join(configs_files_path, f))]
 
 print(f'Found config files: {all_configs_files_names}')
 

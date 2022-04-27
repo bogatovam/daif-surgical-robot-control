@@ -9,3 +9,4 @@ tensorboard
 omegaconf
 jupyterlab
 sympy
+stable-baselines3

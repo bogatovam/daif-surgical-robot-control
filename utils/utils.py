@@ -4,6 +4,8 @@ import pandas as pd
 from pathlib import Path
 from itertools import repeat
 from collections import OrderedDict
+import numpy as np
+import random
 
 
 def ensure_dir(dirname):
@@ -11,20 +13,24 @@ def ensure_dir(dirname):
     if not dirname.is_dir():
         dirname.mkdir(parents=True, exist_ok=False)
 
+
 def read_json(fname):
     fname = Path(fname)
     with fname.open('rt') as handle:
         return json.load(handle, object_hook=OrderedDict)
+
 
 def write_json(content, fname):
     fname = Path(fname)
     with fname.open('wt') as handle:
         json.dump(content, handle, indent=4, sort_keys=False)
 
+
 def inf_loop(data_loader):
     ''' wrapper function for endless data loader. '''
     for loader in repeat(data_loader):
         yield from loader
+
 
 def prepare_device(n_gpu_use):
     """
@@ -42,6 +48,7 @@ def prepare_device(n_gpu_use):
     device = torch.device('cuda:0' if n_gpu_use > 0 else 'cpu')
     list_ids = list(range(n_gpu_use))
     return device, list_ids
+
 
 class MetricTracker:
     def __init__(self, *keys, writer=None):
@@ -65,3 +72,24 @@ class MetricTracker:
 
     def result(self):
         return dict(self._data.average)
+
+
+def set_random_seed(seed: int, using_cuda: bool = False) -> None:
+    """
+    Seed the different random generators.
+
+    :param seed:
+    :param using_cuda:
+    """
+    # Seed python RNG
+    random.seed(seed)
+    # Seed numpy RNG
+    np.random.seed(seed)
+    # seed the RNG for all devices (both CPU and CUDA)
+    torch.manual_seed(seed)
+
+    if using_cuda:
+        # Deterministic operations for CuDNN, it may impact performances
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.cuda.manual_seed_all(seed)

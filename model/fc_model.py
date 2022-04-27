@@ -1,7 +1,8 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from stable_baselines3.common.policies import BaseModel
+
+from base import BaseModel
 
 
 class FcModel(BaseModel):
