@@ -223,7 +223,7 @@ class Agent:
         # Convert to float, rescale, convert to torch tensor
         # (this doesn't require a copy)
         screen = np.ascontiguousarray(screen, dtype=np.float32) / 255
-        screen = torch.from_numpy(screen)
+        screen = torch.tensor(screen)
         # Resize, and add a batch dimension (BCHW)
         screen = self.resize(screen).unsqueeze(0).to(device)
         screen = screen[:, :, 2:-1, 3:-2]
