@@ -1,0 +1,9 @@
+env_id: "NeedleReach-v0"
+expl_noise: 0.1
+batch_size: 2048
+buffer_size: 2.0e+5
+replay_k: 4
+lr: 1.0e-4
+policy_noise: 0.2
+noise_clip: 0.5
+render_mode: "human"

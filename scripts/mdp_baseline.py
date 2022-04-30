@@ -17,15 +17,16 @@ def preprocess_obs(state):
 
 
 class ReplayMemory:
-    def __init__(self, capacity, obs_shape, actions_shape,  device='cpu'):
+    def __init__(self, capacity, obs_shape, actions_shape, device='cpu'):
         self.device = device
 
         self.capacity = capacity  # The maximum number of items to be stored in memory
 
         # Initialize (empty) memory tensors
         self.obs_mem = torch.empty([capacity] + [dim for dim in obs_shape], dtype=torch.float32, device=self.device)
-        self.action_mem = torch.empty([capacity] + [dim for dim in actions_shape], dtype=torch.int64, device=self.device)
-        self.reward_mem = torch.empty(capacity, dtype=torch.int8, device=self.device)
+        self.action_mem = torch.empty([capacity] + [dim for dim in actions_shape], dtype=torch.float32,
+                                      device=self.device)
+        self.reward_mem = torch.empty(capacity, dtype=torch.float32, device=self.device)
         self.done_mem = torch.empty(capacity, dtype=torch.int8, device=self.device)
         self.push_count = 0  # The number of times new data has been pushed to memory
 
@@ -110,21 +111,29 @@ class Model(nn.Module):
         return y
 
 
-class PolicyNets(nn.Module):
-    def __init__(self, n_inputs, n_outputs, output_dim, n_hidden=64, lr=1e-3, device='cpu'):
-        super(PolicyNets, self).__init__()
+class ActionsNet(nn.Module):
+    def __init__(self, state_dim, action_dim, lr=1e-3, device='cpu'):
+        super(ActionsNet, self).__init__()
 
-        self.nets_per_action_dim = [Model(n_inputs, n_outputs, n_hidden, lr, True, device) for _ in range(output_dim)]
+        self.l1 = nn.Linear(state_dim, 512)
+        self.l2 = nn.Linear(512, 1024)
+        self.l3 = nn.Linear(1024, 512)
+        self.l4 = nn.Linear(512, action_dim)
+        self.relu1 = nn.ReLU()
+        self.relu2 = nn.ReLU()
+
         self.device = device
         self.to(self.device)
+        self.optimizer = optim.Adam(self.parameters(), lr)  # Adam optimizer
 
-    def forward(self, x):
-        results = []
-        for net in self.nets_per_action_dim:
-            results.append(net(x))
-
-        results = torch.stack(results)
-        return results
+    def forward(self, state):
+        x = self.l1(state)
+        x = self.l2(x)
+        x = self.relu1(x)
+        x = self.l3(x)
+        x = self.relu2(x)
+        x = self.l4(x)
+        return torch.tanh(x)
 
 
 class Agent:
@@ -134,18 +143,19 @@ class Agent:
                                 self.env.observation_space['desired_goal'].shape)  # The shape of observations
         self.obs_size = np.prod(self.obs_shape)  # The size of the observation
         self.actions_shape = self.env.action_space.shape  # The size of the observation
-        # self.n_actions = self.env.action_space.shape[-1]
-        self.n_actions = 40
+        # self.n_actions = self.envs.action_space.shape[-1]
+        self.n_actions = 1
+        self.action_dim = self.env.action_space.shape[-1]
         self.freeze_cntr = 0  # Keeps track of when to (un)freeze the target network
         # Initialize the networks:
-        self.transition_net = Model(self.obs_size + 1, self.obs_size, self.n_hidden_trans, lr=self.lr_trans,
+        self.transition_net = Model(self.obs_size + self.action_dim, self.obs_size, self.n_hidden_trans,
+                                    lr=self.lr_trans,
                                     device=self.device)
 
         # self.policy_net = Model(self.obs_size, self.n_actions, self.n_hidden_pol, lr=self.lr_pol, softmax=True,
         #                         device=self.device)
 
-        self.policy_net = PolicyNets(self.obs_size, self.n_actions, self.env.action_space.shape[-1], self.n_hidden_pol,
-                                     lr=self.lr_pol, device=self.device)
+        self.policy_net = ActionsNet(self.obs_size, self.action_dim, lr=self.lr_val, device=self.device)
 
         self.value_net = Model(self.obs_size, self.n_actions, self.n_hidden_val, lr=self.lr_val, device=self.device)
         if self.load_network:  # If true: load the networks given paths
@@ -171,7 +181,7 @@ class Agent:
         # The default parameters
         default_parameters = {
             'run_id': "_rX", 'device': 'cpu',
-            'env': 'NeedleReach-v0', 'n_episodes': 5000,
+            'envs': 'NeedleReach-v0', 'n_episodes': 5000,
             'n_hidden_trans': 64, 'lr_trans': 1e-3,
             'n_hidden_pol': 64, 'lr_pol': 1e-3,
             'n_hidden_val': 64, 'lr_val': 1e-4,
@@ -209,7 +219,7 @@ class Agent:
         self.run_id = custom_parameters['run_id']  # Is appended to paths to distinguish between runs
         self.device = custom_parameters['device']  # The device used to run the code
 
-        self.env = gym.make(custom_parameters['env'], render_mode='human')  # The environment in which to train
+        self.env = gym.make(custom_parameters['envs'], render_mode='human')  # The environment in which to train
         self.n_episodes = int(custom_parameters['n_episodes'])  # The number of episodes for which to train
 
         # Set number of hidden nodes and learning rate for each network
@@ -267,8 +277,8 @@ class Agent:
     def select_action(self, obs):
         with torch.no_grad():
             # Determine the action distribution given the current observation:
-            policy = self.policy_net(obs)
-            return torch.multinomial(policy, 1)
+            return self.policy_net(obs).flatten()
+            # return torch.multinomial(policy, 1).cpu().data.numpy().flatten()
 
     def get_mini_batches(self):
         # Retrieve transition data in mini batches
@@ -282,11 +292,12 @@ class Agent:
         obs_batch_t2 = all_obs_batch[:, 2].view([self.batch_size] + [dim for dim in self.obs_shape])
 
         # Retrieve the agent's action history for time t0 and time t1
-        action_batch_t0 = all_actions_batch[:, 0].unsqueeze(1)
-        action_batch_t1 = all_actions_batch[:, 1].unsqueeze(1)
+        action_batch_t0 = all_actions_batch[:, 0]
+        action_batch_t1 = all_actions_batch[:, 1]
 
         # At time t0 predict the state at time t1:
-        X = torch.cat((obs_batch_t0, action_batch_t0.float()), dim=1)
+        # append actions vector nearby state
+        X = torch.cat((obs_batch_t0, action_batch_t0), dim=1)
         pred_batch_t0t1 = self.transition_net(X)
 
         # Determine the prediction error wrt time t0-t1:
@@ -316,7 +327,7 @@ class Agent:
                     -reward_batch_t1 + pred_error_batch_t0t1 + self.Beta * weighted_targets)
 
         # Determine the Expected free energy at time t1 according to the value network:
-        efe_batch_t1 = self.value_net(obs_batch_t1).gather(1, action_batch_t1)
+        efe_batch_t1 = self.value_net(obs_batch_t1)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
         value_net_loss = F.mse_loss(expected_free_energy_estimate_batch, efe_batch_t1)
@@ -325,7 +336,7 @@ class Agent:
 
     def compute_variational_free_energy(self, obs_batch_t1, pred_error_batch_t0t1):
         # Determine the action distribution for time t1:
-        policy_batch_t1 = self.policy_net(obs_batch_t1)
+        policy_batch_t1 = self.policy_net(obs_batch_t1) + 1
 
         # Determine the Expected free energys for time t1:
         expected_free_energy_t1 = self.value_net(obs_batch_t1).detach()
@@ -393,7 +404,7 @@ class Agent:
         results = []
         for ith_episode in range(self.n_episodes):
             total_reward = 0
-            obs, _ = self.env.reset()
+            obs = self.env.reset()
             obs = preprocess_obs(obs)
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
             done = False
@@ -401,8 +412,10 @@ class Agent:
             while not done:
                 action = self.select_action(obs)
                 self.memory.push(obs, action, reward, done)
-                obs, reward, done, _ = self.env.step(action.item())
 
+                obs, reward, done, _ = self.env.step(action.cpu().data.numpy())
+
+                done = bool(done)
                 obs = preprocess_obs(obs)
                 obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
                 total_reward += reward

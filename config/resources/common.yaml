@@ -1,0 +1,6 @@
+env_log_folder: "D:/2022/thesis/docs/logs/envs"
+tb_log_folder: "D:/2022/thesis/docs/logs/tensorboard"
+seed: 42
+start_timesteps: 5000
+eval_freq: 10000
+max_timesteps: 2.0e+5

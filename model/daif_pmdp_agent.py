@@ -72,7 +72,7 @@ class Agent:
 
         # The default parameters
         default_parameters = {'run_id': "_rX", 'device': 'cuda',
-                              'env': 'CartPole-v1', 'n_episodes': 5000,
+                              'envs': 'CartPole-v1', 'n_episodes': 5000,
                               'n_screens': 4, 'n_latent_states': 32, 'lr_vae': 1e-5, 'alpha': 25000,
                               'n_hidden_trans': 64, 'lr_trans': 1e-3,
                               'n_hidden_pol': 64, 'lr_pol': 1e-3,
@@ -119,7 +119,7 @@ class Agent:
         self.run_id = custom_parameters['run_id']  # Is appended to paths to distinguish between runs
         self.device = custom_parameters['device']  # The device used to run the code
 
-        self.env = gym.make(custom_parameters['env'])  # The environment in which to train
+        self.env = gym.make(custom_parameters['envs'])  # The environment in which to train
         self.n_episodes = int(custom_parameters['n_episodes'])  # The number of episodes for which to train
 
         # Set number of hidden nodes and learning rate for each network

@@ -7,11 +7,18 @@ from collections import OrderedDict
 import numpy as np
 import random
 
+from os import listdir
+from os.path import isfile, join
+
 
 def ensure_dir(dirname):
     dirname = Path(dirname)
     if not dirname.is_dir():
         dirname.mkdir(parents=True, exist_ok=False)
+
+
+def get_all_files_from_dir(dirname):
+    return [join(dirname, f) for f in listdir(dirname) if isfile(join(dirname, f))]
 
 
 def read_json(fname):
