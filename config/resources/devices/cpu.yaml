@@ -1,1 +1,5 @@
 device_id: cpu
+render_mode: human
+memory_capacity: 65536
+batch_size: 64
+save_model: False

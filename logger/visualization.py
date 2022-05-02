@@ -3,7 +3,7 @@ from datetime import datetime
 
 
 class TensorboardWriter():
-    def __init__(self, log_dir, logger, enabled):
+    def __init__(self, log_dir, enabled):
         self.writer = None
         self.selected_module = ""
 
@@ -25,7 +25,7 @@ class TensorboardWriter():
                 message = "Warning: visualization (Tensorboard) is configured to use, but currently not installed on " \
                     "this machine. Please install TensorboardX with 'pip install tensorboardx', upgrade PyTorch to " \
                     "version >= 1.1 to use 'torch.utils.tensorboard' or turn off the option in the 'config.json' file."
-                logger.warning(message)
+                print(message)
 
         self.step = 0
         self.mode = ''
