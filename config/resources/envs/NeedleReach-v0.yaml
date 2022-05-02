@@ -1,4 +1,4 @@
-env_id: "NeedleReach-v0"
+env_id: "BiPegTransfer-v0"
 expl_noise: 0.1
 batch_size: 2048
 buffer_size: 2.0e+5

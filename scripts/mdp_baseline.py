@@ -136,6 +136,27 @@ class ActionsNet(nn.Module):
         return torch.tanh(x)
 
 
+class MLP(nn.Module):
+    def __init__(self, input_size, layer_sizes, output_size, lr=1e-3, output_activation=torch.nn.Identity,
+                 activation=torch.nn.ELU, device='cpu'):
+        super(MLP, self).__init__()
+        sizes = [input_size] + layer_sizes + [output_size]
+        layers = []
+        for i in range(len(sizes) - 1):
+            act = activation if i < len(sizes) - 2 else output_activation
+            layers += [torch.nn.Linear(sizes[i], sizes[i + 1]), act()]
+        self.optimizer = optim.Adam(self.parameters(), lr)  # Adam optimizer
+
+        self.device = device
+        self.to(self.device)
+
+    def forward(self, inp):
+        x = inp
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 class Agent:
     def __init__(self, argv):
         self.set_parameters(argv)  # Set parameters
@@ -143,9 +164,9 @@ class Agent:
                                 self.env.observation_space['desired_goal'].shape)  # The shape of observations
         self.obs_size = np.prod(self.obs_shape)  # The size of the observation
         self.actions_shape = self.env.action_space.shape  # The size of the observation
-        # self.n_actions = self.envs.action_space.shape[-1]
-        self.n_actions = 1
+        self.n_actions = self.env.action_space.shape[-1]
         self.action_dim = self.env.action_space.shape[-1]
+        self.n_sampled_actions = 50
         self.freeze_cntr = 0  # Keeps track of when to (un)freeze the target network
         # Initialize the networks:
         self.transition_net = Model(self.obs_size + self.action_dim, self.obs_size, self.n_hidden_trans,
@@ -155,18 +176,18 @@ class Agent:
         # self.policy_net = Model(self.obs_size, self.n_actions, self.n_hidden_pol, lr=self.lr_pol, softmax=True,
         #                         device=self.device)
 
-        self.policy_net = ActionsNet(self.obs_size, self.action_dim, lr=self.lr_val, device=self.device)
-
-        self.value_net = Model(self.obs_size, self.n_actions, self.n_hidden_val, lr=self.lr_val, device=self.device)
-        if self.load_network:  # If true: load the networks given paths
-            self.transition_net.load_state_dict(torch.load(self.network_load_path.format("trans")))
-            self.transition_net.eval()
-            self.policy_net.load_state_dict(torch.load(self.network_load_path.format("pol")))
-            self.policy_net.eval()
-            self.value_net.load_state_dict(torch.load(self.network_load_path.format("val")))
-            self.value_net.eval()
-        self.target_net = Model(self.obs_size, self.n_actions, self.n_hidden_val, lr=self.lr_val, device=self.device)
-        self.target_net.load_state_dict(self.value_net.state_dict())
+        self.prediction_policy_mu_network = MLP(self.obs_size, [64] * 2, self.action_dim)
+        self.prediction_policy_logstd_network = MLP(self.obs_size, [64] * 2, self.action_dim)
+        self.value_net = MLP(self.obs_size + self.action_dim, [64] * 2, 1)
+        # if self.load_network:  # If true: load the networks given paths
+        #     self.transition_net.load_state_dict(torch.load(self.network_load_path.format("trans")))
+        #     self.transition_net.eval()
+        #     self.policy_net.load_state_dict(torch.load(self.network_load_path.format("pol")))
+        #     self.policy_net.eval()
+        #     self.value_net.load_state_dict(torch.load(self.network_load_path.format("val")))
+        #     self.value_net.eval()
+        self.target_net = MLP(self.obs_size + self.action_dim, [64] * 2, 1)
+        # self.target_net.load_state_dict(self.value_net.state_dict())
         # Initialize the replay memory
         self.memory = ReplayMemory(self.memory_capacity, self.obs_shape, self.actions_shape, device=self.device)
         # When sampling from memory at index i, obs_indices indicates that we want observations
@@ -176,6 +197,7 @@ class Agent:
         self.reward_indices = [1]
         self.done_indices = [0]
         self.max_n_indices = max(max(self.obs_indices, self.action_indices, self.reward_indices, self.done_indices)) + 1
+        # self.prediction_value_network = mlp(self.obs_size, [64] * self.n_actions, 2 * 10 + 1)
 
     def set_parameters(self, argv):
         # The default parameters
@@ -277,8 +299,9 @@ class Agent:
     def select_action(self, obs):
         with torch.no_grad():
             # Determine the action distribution given the current observation:
-            return self.policy_net(obs).flatten()
-            # return torch.multinomial(policy, 1).cpu().data.numpy().flatten()
+            mu, std = self.prediction(obs)
+            distribution = torch.distributions.normal.Normal(mu, std)
+            return distribution.sample().squeeze(0).detach().cpu().numpy().flatten()
 
     def get_mini_batches(self):
         # Retrieve transition data in mini batches
@@ -313,13 +336,18 @@ class Agent:
 
         with torch.no_grad():
             # Determine the action distribution for time t2:
-            policy_batch_t2 = self.policy_net(obs_batch_t2)
+            mu, std = self.prediction(obs_batch_t2)
+
+            distribution = torch.distributions.normal.Normal(mu, std)
+            sampled_actions_batch_t1 = distribution.sample(sample_shape=self.n_sampled_actions)
+            probs = distribution.log_prob(sampled_actions_batch_t1)
 
             # Determine the target EFEs for time t2:
-            target_expected_free_energies_batch_t2 = self.target_net(obs_batch_t2)
+            target_expected_free_energies_batch_t2 = self.target_net(
+                torch.cat((obs_batch_t1, sampled_actions_batch_t1), dim=1))
 
             # Weigh the target EFEs according to the action distribution:
-            weighted_targets = ((1 - done_batch_t2) * policy_batch_t2 *
+            weighted_targets = ((1 - done_batch_t2) * probs *
                                 target_expected_free_energies_batch_t2).sum(-1).unsqueeze(1)
 
             # Determine the batch of bootstrapped estimates of the EFEs:
@@ -327,7 +355,7 @@ class Agent:
                     -reward_batch_t1 + pred_error_batch_t0t1 + self.Beta * weighted_targets)
 
         # Determine the Expected free energy at time t1 according to the value network:
-        efe_batch_t1 = self.value_net(obs_batch_t1)
+        efe_batch_t1 = self.value_net(torch.cat((obs_batch_t1, action_batch_t1), dim=1))
 
         # Determine the MSE loss between the EFE estimates and the value network output:
         value_net_loss = F.mse_loss(expected_free_energy_estimate_batch, efe_batch_t1)
@@ -336,7 +364,11 @@ class Agent:
 
     def compute_variational_free_energy(self, obs_batch_t1, pred_error_batch_t0t1):
         # Determine the action distribution for time t1:
-        policy_batch_t1 = self.policy_net(obs_batch_t1) + 1
+        # policy_batch_t1 = self.policy_net(obs_batch_t1)
+
+        mu, std = self.prediction(obs_batch_t1)  # (batch_size, 5)
+
+        distribution = torch.distributions.normal.Normal(mu, std)
 
         # Determine the Expected free energys for time t1:
         expected_free_energy_t1 = self.value_net(obs_batch_t1).detach()
@@ -345,12 +377,14 @@ class Agent:
         boltzmann_expected_free_energy_batch_t1 = torch.softmax(-self.gamma * expected_free_energy_t1, dim=1).clamp(
             min=1e-9, max=1 - 1e-9)
 
+        sampled_actions_batch_t1 = distribution.sample(sample_shape=self.n_sampled_actions)
+        probs = distribution.log_prob(sampled_actions_batch_t1)
         # Weigh them according to the action distribution:
-        energy_batch = -(policy_batch_t1 * torch.log(boltzmann_expected_free_energy_batch_t1)).sum(-1).view(
+        energy_batch = -(probs * torch.log(boltzmann_expected_free_energy_batch_t1)).sum(-1).view(
             self.batch_size, 1)
 
         # Determine the entropy of the action distribution
-        entropy_batch = -(policy_batch_t1 * torch.log(policy_batch_t1)).sum(-1).view(self.batch_size, 1)
+        entropy_batch = -(distribution.entropy()).sum(-1).view(self.batch_size, 1)
 
         # Determine the Variable Free Energy, then take the mean over all batch samples:
         vfe_batch = pred_error_batch_t0t1 + (energy_batch - entropy_batch)
@@ -382,7 +416,8 @@ class Agent:
         vfe = self.compute_variational_free_energy(obs_batch_t1, pred_error_batch_t0t1)
         # Reset the gradients:
         self.transition_net.optimizer.zero_grad()
-        self.policy_net.optimizer.zero_grad()
+        self.prediction_policy_mu_network.optimizer.zero_grad()
+        self.prediction_policy_logstd_network.optimizer.zero_grad()
         self.value_net.optimizer.zero_grad()
 
         # Compute the gradients:
@@ -391,8 +426,15 @@ class Agent:
 
         # Perform gradient descent:
         self.transition_net.optimizer.step()
-        self.policy_net.optimizer.step()
+        self.prediction_policy_mu_network.optimizer.step()
+        self.prediction_policy_logstd_network.optimizer.step()
         self.value_net.optimizer.step()
+
+    def prediction(self, encoded_state):
+        mu = self.prediction_policy_mu_network(encoded_state)
+        log_std = self.prediction_policy_logstd_network(encoded_state)
+        log_std = torch.clamp(log_std, *(-20, 2))
+        return mu, log_std
 
     def train(self):
         print()
