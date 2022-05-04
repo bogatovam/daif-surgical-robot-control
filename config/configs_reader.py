@@ -2,9 +2,9 @@ from omegaconf import OmegaConf
 from os.path import join
 
 from utils import utils
-import const
+from config import const
 
-configs_files_path = join(const.ROOT_DIR_PATH, 'resources')
+configs_files_path = join(const.ROOT_DIR_PATH, 'config\\resources')
 
 all_configs_files_names = utils.get_all_files_from_dir(configs_files_path)
 

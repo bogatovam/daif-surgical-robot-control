@@ -1,8 +1,17 @@
-env_log_folder: logs/envs"
-tb_log_folder: "logs/tensorboard"
-log_folder: "logs/log"
-seed: 42
-n_episodes: 5000
 experiment_name: baseline
-model_path: models
+
+monitor_file: logs\{experiment_name}\monitor.csv
+tb_log_folder: logs\{experiment_name}\tensorboard
+seed: 42
+
+n_epochs: 50
+n_cycles: 50
+n_batches: 40
+max_episode_steps: 200
+
+should_save_model: true
+model_path: models\{experiment_name}
 model_save_timer: 500
+
+should_save_episode_video: true
+episode_video_timer: 10

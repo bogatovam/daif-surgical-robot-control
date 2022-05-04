@@ -21,16 +21,6 @@ class BaseModel(nn.Module):
         """
         raise NotImplementedError
 
-    @property
-    def device(self) -> torch.device:
-        """Infer which device this policy lives on by inspecting its parameters.
-        If it has no parameters, the 'cpu' device is used as a fallback.
-
-        :return:"""
-        for param in self.parameters():
-            return param.device
-        return get_device("cpu")
-
     def save(self, path: str) -> None:
         """
         Save model to a given location.

@@ -1,4 +1,6 @@
 import json
+import os
+
 import torch
 import pandas as pd
 from pathlib import Path
@@ -94,3 +96,14 @@ def set_random_seed(seed: int, device: str = 'cpu') -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.cuda.manual_seed_all(seed)
+
+
+def create_dirs(dirs):
+    try:
+        for dir_ in dirs:
+            if not os.path.exists(dir_):
+                os.makedirs(dir_)
+        return 0
+    except Exception as err:
+        print("Creating directories error: {0}".format(err))
+        exit(-1)

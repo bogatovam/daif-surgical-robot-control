@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+import surrol.gym as surrol_gym
+
 from stable_baselines3.common.monitor import Monitor
 
 from base import BaseModel
@@ -110,14 +112,209 @@ class MLP(BaseModel):
         return x
 
 
+import threading
+import numpy as np
+
+"""
+the replay buffer here is basically from the openai baselines code
+
+"""
+
+
+class ReplayBuffer:
+    def __init__(self, env, max_episode_steps, buffer_size, sample_func, device):
+        self.observation_dim, self.goal_dim, self.action_dim, self.action_max = get_env_parameters(env)
+        self.device = device
+
+        self.max_episode_steps = max_episode_steps
+        self.size = buffer_size // self.max_episode_steps
+        # memory management
+        self.current_size = 0
+        self.n_transitions_stored = 0
+        self.sample_func = sample_func
+        # create the buffer to store info
+
+        self.observation_memory = torch.empty([self.size, self.max_episode_steps + 1, self.observation_dim],
+                                              dtype=torch.float32, device=self.device)
+        self.achieved_goal_memory = torch.empty([self.size, self.max_episode_steps + 1, self.goal_dim],
+                                                dtype=torch.float32, device=self.device)
+        self.desired_goal_memory = torch.empty([self.size, self.max_episode_steps, self.goal_dim],
+                                               dtype=torch.float32, device=self.device)
+
+        self.actions_memory = torch.empty([self.size, self.max_episode_steps, self.action_dim],
+                                          dtype=torch.float32, device=self.device)
+        self.done_memory = torch.empty([self.size, self.max_episode_steps, 1], dtype=torch.int8, device=self.device)
+
+        # thread lock
+        self.lock = threading.Lock()
+
+    # store the episode
+    def store_episode(self, observation, achieved_goal, desired_goal, action, batch_size):
+        with self.lock:
+            idxs = self._get_storage_idx(inc=batch_size)
+            # store the informations
+            self.observation_memory[idxs] = observation
+            self.achieved_goal_memory[idxs] = achieved_goal
+            self.desired_goal_memory[idxs] = desired_goal
+            self.actions_memory[idxs] = action
+
+            self.n_transitions_stored += self.max_episode_steps * batch_size
+
+    # sample the data from the replay buffer
+    def sample(self, batch_size):
+        observation_buffer = self.observation_memory[:self.current_size]
+        achieved_goal_buffer = self.achieved_goal_memory[:self.current_size]
+        desired_goal_buffer = self.desired_goal_memory[:self.current_size]
+        actions_buffer = self.actions_memory[:self.current_size]
+        next_observation_buffer = observation_buffer[:, 1:, :]
+        next_achieved_goal_buffer = achieved_goal_buffer[:, 1:, :]
+
+        temp_buffers = {}
+        with self.lock:
+            for key in self.buffers.keys():
+                temp_buffers[key] = self.buffers[key][:self.current_size]
+        temp_buffers['next_observation'] = temp_buffers['observation'][:, 1:, :]
+        temp_buffers['next_achieved_goal'] = temp_buffers['achieved_goal'][:, 1:, :]
+
+        return self.sample_func(observation_buffer,
+                                achieved_goal_buffer, desired_goal_buffer,
+                                actions_buffer,
+                                next_observation_buffer, next_achieved_goal_buffer,
+                                batch_size)
+
+    def _get_storage_idx(self, inc=None):
+        inc = inc or 1
+        if self.current_size + inc <= self.size:
+            idx = np.arange(self.current_size, self.current_size + inc)
+        elif self.current_size < self.size:
+            overflow = inc - (self.size - self.current_size)
+            idx_a = np.arange(self.current_size, self.size)
+            idx_b = np.random.randint(0, self.current_size, overflow)
+            idx = np.concatenate([idx_a, idx_b])
+        else:
+            idx = np.random.randint(0, self.size, inc)
+        self.current_size = min(self.size, self.current_size + inc)
+        if inc == 1:
+            idx = idx[0]
+        return idx
+
+
+class HERSampler:
+    def __init__(self, replay_strategy, replay_k, reward_func=None):
+        self.replay_strategy = replay_strategy
+        self.replay_k = replay_k
+        if self.replay_strategy == 'future':
+            self.future_p = 1 - (1. / (1 + replay_k))
+        else:
+            self.future_p = 0
+        self.reward_func = reward_func
+
+    def sample_her_transitions(self, episode_batch, batch_size_in_transitions):
+        T = episode_batch['actions'].shape[1]
+        rollout_batch_size = episode_batch['actions'].shape[0]
+        batch_size = batch_size_in_transitions
+        # select which rollouts and which timesteps to be used
+        episode_idxs = np.random.randint(0, rollout_batch_size, batch_size)
+        t_samples = np.random.randint(T, size=batch_size)
+        transitions = {key: episode_batch[key][episode_idxs, t_samples].copy() for key in episode_batch.keys()}
+        # her idx
+        her_indexes = np.where(np.random.uniform(size=batch_size) < self.future_p)
+        future_offset = np.random.uniform(size=batch_size) * (T - t_samples)
+        future_offset = future_offset.astype(int)
+        future_t = (t_samples + 1 + future_offset)[her_indexes]
+        # replace go with achieved goal
+        future_ag = episode_batch['achieved_goal'][episode_idxs[her_indexes], future_t]
+        transitions['desired_goal'][her_indexes] = future_ag
+        # to get the params to re-compute reward
+        transitions['reward'] = np.expand_dims(
+            self.reward_func(transitions['next_achieved_goal'], transitions['desired_goal'], None), 1)
+        transitions = {k: transitions[k].reshape(batch_size, *transitions[k].shape[1:]) for k in transitions.keys()}
+
+        return transitions
+
+
+class Normalizer:
+    def __init__(self, size, eps=1e-2, default_clip_range=np.inf):
+        self.size = size
+        self.eps = eps
+        self.default_clip_range = default_clip_range
+        # some local information
+        self.local_sum = np.zeros(self.size, np.float32)
+        self.local_sumsq = np.zeros(self.size, np.float32)
+        self.local_count = np.zeros(1, np.float32)
+        # get the total sum sumsq and sum count
+        self.total_sum = np.zeros(self.size, np.float32)
+        self.total_sumsq = np.zeros(self.size, np.float32)
+        self.total_count = np.ones(1, np.float32)
+        # get the mean and std
+        self.mean = np.zeros(self.size, np.float32)
+        self.std = np.ones(self.size, np.float32)
+        # thread locker
+        self.lock = threading.Lock()
+
+    # update the parameters of the normalizer
+    def update(self, v):
+        v = v.reshape(-1, self.size)
+        # do the computing
+        with self.lock:
+            self.local_sum += v.sum(axis=0)
+            self.local_sumsq += (np.square(v)).sum(axis=0)
+            self.local_count[0] += v.shape[0]
+
+    # sync the parameters across the cpus
+    def sync(self, local_sum, local_sumsq, local_count):
+        local_sum[...] = self._mpi_average(local_sum)
+        local_sumsq[...] = self._mpi_average(local_sumsq)
+        local_count[...] = self._mpi_average(local_count)
+        return local_sum, local_sumsq, local_count
+
+    def recompute_stats(self):
+        with self.lock:
+            local_count = self.local_count.copy()
+            local_sum = self.local_sum.copy()
+            local_sumsq = self.local_sumsq.copy()
+            # reset
+            self.local_count[...] = 0
+            self.local_sum[...] = 0
+            self.local_sumsq[...] = 0
+        # synrc the stats
+        sync_sum, sync_sumsq, sync_count = self.sync(local_sum, local_sumsq, local_count)
+        # update the total stuff
+        self.total_sum += sync_sum
+        self.total_sumsq += sync_sumsq
+        self.total_count += sync_count
+        # calculate the new mean and std
+        self.mean = self.total_sum / self.total_count
+        self.std = np.sqrt(np.maximum(np.square(self.eps), (self.total_sumsq / self.total_count) - np.square(
+            self.total_sum / self.total_count)))
+
+    # average across the cpu's data
+    def _mpi_average(self, x):
+        buf = np.zeros_like(x)
+        # buf /= MPI.COMM_WORLD.Get_size()
+        buf /= 1
+        return buf
+
+    # normalize the observation
+    def normalize(self, v, clip_range=None):
+        if clip_range is None:
+            clip_range = self.default_clip_range
+        return np.clip((v - self.mean) / (self.std), -clip_range, clip_range)
+
+
 class Agent:
     def __init__(self, env, config):
         self.env = env
-        self.state_dim, self.action_dim, self.max_action_value = get_env_parameters(env)
+        self.experiment_name = config.experiment_name
+        self.observation_dim, self.goal_dim, self.action_dim, self.action_max = get_env_parameters(env)
 
         self.device = config.device_id
 
-        self.n_episodes = int(config.n_episodes)
+        self.n_epochs = int(config.n_epochs)
+        self.n_cycles = int(config.n_cycles)
+        self.n_batches = int(config.n_batches)
+        self._max_episode_steps = int(config.max_episode_steps)
+
         self.batch_size = int(config.batch_size)
         self.memory_capacity = int(config.memory_capacity)
 
@@ -125,11 +322,18 @@ class Agent:
 
         self.gamma = float(config.gamma)  # A precision parameter
         self.beta = float(config.beta)  # The discount rate
+        self.noise_eps = float(config.noise_eps)  # The discount rate
+        self.random_eps = float(config.random_eps)  # The discount rate
+
         self.print_timer = int(config.print_timer)
+
         self.should_save_model = interpret_boolean(config.should_save_model)
-        self.model_path = prepare_path(config.model_path, config.experiment_name)
+        self.model_path = prepare_path(config.model_path, experiment_name=config.experiment_name)
         self.final_model_path = os.path.join(self.model_path, "final")
         self.model_save_timer = int(config.network_save_timer)
+
+        self.should_save_episode_video = interpret_boolean(config.should_save_episode_video)
+        self.episode_video_timer = int(config.episode_video_timer)
 
         self.state_shape = np.add(self.env.observation_space['observation'].shape,
                                   self.env.observation_space['desired_goal'].shape)
@@ -149,7 +353,14 @@ class Agent:
 
         self.value_net = MLP(self.state_size + self.action_dim, [64] * 2, 1)
         self.target_net = MLP(self.state_size + self.action_dim, [64] * 2, 1)
-        self.memory = ReplayMemory(self.memory_capacity, self.state_shape, self.actions_shape, device=self.device)
+
+        self.her_module = HERSampler(config.replay_strategy, config.replay_k, self.env.compute_reward)
+        # create the replay buffer
+        self.buffer = ReplayBuffer(self.env, config.max_episode_steps, self.memory_capacity,
+                                   self.her_module.sample_her_transitions, config.device_id)
+
+        self.o_norm = Normalizer(size=env.observation_space.spaces['observation'].shape[0])
+        self.g_norm = Normalizer(size=env.observation_space.spaces['desired_goal'].shape[0])
 
         # When sampling from memory at index i, obs_indices indicates that we want observations
         # with indices i-obs_indices, works the same for the others
@@ -162,19 +373,6 @@ class Agent:
         self.writer = TensorboardWriter(config.log_dir, True)
 
         self.metrics = MetricTracker('vfe', 'efe_mse_loss', 'success_rate', 'reward', writer=self.writer)
-
-    def prediction(self, encoded_state):
-        mu = self.prediction_policy_mu_network(encoded_state)
-        log_std = self.prediction_policy_logstd_network(encoded_state)
-        log_std = torch.clamp(log_std, *(-20, 2))
-        return mu, log_std
-
-    def select_action(self, obs):
-        with torch.no_grad():
-            # Determine the action distribution given the current observation:
-            mu, std = self.prediction(obs)
-            distribution = torch.distributions.normal.Normal(mu, std)
-            return distribution.sample().squeeze(0).detach().cpu().numpy().flatten()
 
     def get_mini_batches(self):
         # Retrieve transition data in mini batches
@@ -265,15 +463,53 @@ class Agent:
 
         return vfe
 
+    # update the network
+    def _update_network(self):
+        # sample the episodes
+        (all_obs_batch, all_desired_goal_batch, all_actions_batch,
+         reward_batch_t1, done_batch_t2) = self.buffer.sample(self.batch_size)
+
+        current_input_tensor = self._preprocess_inputs(transitions['observation'], transitions['desired_goal'])
+        next_input_tensor = self._preprocess_inputs(transitions['next_observation'], transitions['desired_goal'])
+
+        actions_tensor = torch.tensor(transitions['actions'], dtype=torch.float32, device=self.device).unsqueeze(0)
+        reward_tensor = torch.tensor(transitions['reward'], dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        # calculate the target Q value function
+        with torch.no_grad():
+            # do the normalization
+            # concatenate the stuffs
+            actions_next = self.actor_target_network(inputs_next_norm_tensor)
+            q_next_value = self.critic_target_network(inputs_next_norm_tensor, actions_next)
+            q_next_value = q_next_value.detach()
+            target_q_value = reward_tensor + self.args.gamma * q_next_value
+            target_q_value = target_q_value.detach()
+            # clip the q value
+            clip_return = 1 / (1 - self.args.gamma)
+            target_q_value = torch.clamp(target_q_value, -clip_return, 0)
+
+        # the q loss
+        real_q_value = self.critic_network(inputs_norm_tensor, actions_tensor)
+        critic_loss = (target_q_value - real_q_value).pow(2).mean()
+        # the actor loss
+        actions_real = self.actor_network(inputs_norm_tensor)
+        actor_loss = -self.critic_network(inputs_norm_tensor, actions_real).mean()
+        actor_loss += self.args.action_l2 * (actions_real / self.env_params['action_max']).pow(2).mean()
+        # start to update the network
+        self.actor_optim.zero_grad()
+        actor_loss.backward()
+        sync_grads(self.actor_network)
+        self.actor_optim.step()
+        # update the critic_network
+        self.critic_optim.zero_grad()
+        critic_loss.backward()
+        sync_grads(self.critic_network)
+        self.critic_optim.step()
+
     def learn(self):
         # If there are not enough transitions stored in memory, return:
         if self.memory.push_count - self.max_n_indices * 2 < self.batch_size:
             return
-
-        # After every freeze_period time steps, update the target network:
-        if self.freeze_cntr % self.freeze_period == 0:
-            self.target_net.load_state_dict(self.value_net.state_dict())
-        self.freeze_cntr += 1
 
         # Retrieve transition data in mini batches:
         (obs_batch_t0, obs_batch_t1, obs_batch_t2, action_batch_t0,
@@ -309,31 +545,61 @@ class Agent:
     def train(self):
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.datetime.now()))
 
-        results = {'reward': [], 'done': []}
-        for ith_episode in range(self.n_episodes):
-            self.writer.set_step(ith_episode)
+        for epoch in range(self.n_epochs):
+            for _ in range(self.n_cycles):
 
-            total_reward = 0
-            self.metrics.reset()
-            obs = self.env.reset()
-            obs = preprocess_obs(obs)
-            obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
-            done = False
-            reward = 0
+                observation, achieved_goal, desired_goal, done, reward = self._reset()
+
+                collected_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
+
+                for _ in range(self._max_episode_steps):
+                    input_tensor = self._preprocess_inputs(observation, desired_goal)
+                    action = self._select_action(input_tensor)
+
+                    collected_data['observation'].append(observation.copy())
+                    collected_data['achieved_goal'].append(achieved_goal.copy())
+                    collected_data['desired_goal'].append(desired_goal.copy())
+                    collected_data['action'].append(action.copy())
+
+                    # feed the actions into the environment
+                    new_observation, _, _, _ = self.env.step(action)
+
+                    observation = new_observation['observation']
+                    achieved_goal = new_observation['achieved_goal']
+
+                # store the episodes
+                self.buffer.store_episode(**collected_data, batch_size=1)
+                self._update_normalizer(**collected_data)
+
+                for _ in range(self.n_batches):
+                    # train the network
+                    self._update_network()
+                # soft update
+                self._soft_update_target_network(self.actor_target_network, self.actor_network)
+                self._soft_update_target_network(self.critic_target_network, self.critic_network)
+            # start to do the evaluation
+            success_rate = self._eval_agent()
+
+        for episode in range(self.n_episodes):
+            self.writer.set_step(episode)
+
+            results = {'reward': [], 'done': [], 'images': []}
+
+            obs, done, reward = self.reset()
+
             while not done:
                 action = self.select_action(obs)
                 self.memory.push(obs, action, reward, done)
 
                 obs, reward, done, _ = self.env.step(action.cpu().data.numpy())
-
-                done = bool(done)
-                obs = preprocess_obs(obs)
-                obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
-                total_reward += reward
+                obs, reward, done = self.preprocess_step_results(obs, reward, done)
 
                 results['reward'] += [reward]
                 results['done'] += [done]
+                if self.should_save_episode_video and episode % self.episode_video_timer == 0:
+                    results['done'] += [self.env.render()]
 
+                # todo is it stable?
                 self.learn()
                 if done:
                     self.memory.push(obs, -99, -99, done)
@@ -345,12 +611,15 @@ class Agent:
             self.metrics.update('success_rate', success_rate)
             self.metrics.update('reward', avg_reward)
 
-            if ith_episode > 0 and ith_episode % self.print_timer == 0:
+            if self.should_save_episode_video and episode % self.episode_video_timer == 0:
+                self.writer.add_video(self.experiment_name + f'_{episode}', results['images'])
+
+            if episode > 0 and episode % self.print_timer == 0:
                 last_x = np.mean(results[-self.print_timer:])
 
-                print("Episodes: {:4d}, avg score: {:3.2f}, over last {:d}: {:3.2f}".format(ith_episode, avg_reward,
+                print("Episodes: {:4d}, avg score: {:3.2f}, over last {:d}: {:3.2f}".format(episode, avg_reward,
                                                                                             self.print_timer, last_x))
-            if self.should_save_model and ith_episode > 0 and ith_episode % self.model_save_timer == 0:
+            if self.should_save_model and episode > 0 and episode % self.model_save_timer == 0:
                 self.transition_net.save(os.path.join(self.model_path, 'transition_net.pth'))
                 self.prediction_policy_mu_network.save(os.path.join(self.model_path, 'policy_mu_network.pth'))
                 self.prediction_policy_logstd_network.save(os.path.join(self.model_path, 'policy_logstd_network.pth'))
@@ -380,17 +649,90 @@ class Agent:
         for name, p in self.value_net.named_parameters():
             self.writer.add_histogram(name, p, bins='auto')
 
+    def _reset(self):
+        self.metrics.reset()
+        native_observation = self.env.reset()
 
-def preprocess_obs(state):
-    if isinstance(state, dict):
-        state = np.concatenate((state['observation'], state['desired_goal']), -1)
+        observation = native_observation['observation']
+        achieved_goal = native_observation['achieved_goal']
+        desired_goal = native_observation['desired_goal']
 
-    return state
+        # observation = torch.tensor(observation, dtype=torch.float32, device=self.device)
+        # achieved_goal = torch.tensor(achieved_goal, dtype=torch.float32, device=self.device)
+        # desired_goal = torch.tensor(desired_goal, dtype=torch.float32, device=self.device)
+
+        return observation, achieved_goal, desired_goal, False, 0
+
+    def _select_action(self, input_tensor):
+        with torch.no_grad():
+            # Determine the action distribution given the current observation:
+            mu, std = self.prediction(input_tensor)
+            distribution = torch.distributions.normal.Normal(mu, std)
+            action = distribution.sample().squeeze(0).detach().cpu().numpy().flatten()
+
+            # add the gaussian
+            action += self.noise_eps * self.action_max * np.random.randn(*action.shape)
+            action = np.clip(action, -self.action_max, self.action_max)
+            # random actions...
+            random_actions = np.random.uniform(low=-self.action_max, high=self.action_max, size=self.action_dim)
+            # choose if use the random actions
+            action += np.random.binomial(1, self.random_eps, 1)[0] * (random_actions - action)
+            return action
+
+    def prediction(self, input_tensor):
+        mu = self.prediction_policy_mu_network(input_tensor)
+        log_std = self.prediction_policy_logstd_network(input_tensor)
+        log_std = torch.clamp(log_std, *(-20, 2))
+        return mu, log_std
+
+    def _preprocess_inputs(self, observation, goal):
+        observation, goal = self._preprocess_observation_and_goal(observation, goal)
+        obs_norm = self.o_norm.normalize(observation)
+        goal_norm = self.g_norm.normalize(goal)
+        # concatenate the stuffs
+        inputs = np.concatenate([obs_norm, goal_norm])
+        return torch.tensor(inputs, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+    def _preprocess_observation_and_goal(self, o, g):
+        o = np.clip(o, -200, 200)
+        g = np.clip(g, -200, 200)
+        return o, g
+
+    def _update_normalizer(self, observation, achieved_goal, desired_goal, action):
+        next_observation = observation[:, 1:, :]
+        next_achieved_goal = achieved_goal[:, 1:, :]
+
+        # get the number of normalization transitions
+        num_transitions = action.shape[1]
+        # create the new buffer to store them
+        buffer_temp = {'observation': observation,
+                       'achieved_goal': achieved_goal,
+                       'desired_goal': desired_goal,
+                       'actions': action,
+                       'next_observation': next_observation,
+                       'next_achieved_goal': next_achieved_goal,
+                       }
+
+        transitions = self.her_module.sample_her_transitions(buffer_temp, num_transitions)
+        obs, g = transitions['observation'], transitions['desired_goal']
+        transitions['observation'], transitions['desired_goal'] = self._preprocess_observation_and_goal(obs, g)
+        # update
+        self.o_norm.update(transitions['observation'])
+        self.g_norm.update(transitions['desired_goal'])
+        # recompute the stats
+        self.o_norm.recompute_stats()
+        self.g_norm.recompute_stats()
+
+    def preprocess_step_results(self, obs, reward, done):
+        done = bool(done)
+        obs = preprocess_obs(obs)
+        obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        return obs, reward, done
 
 
 def make_env(config):
     env = gym.make(config.env_id, render_mode=config.render_mode)
-    env = Monitor(env, prepare_path(config.env_log_folder, config.experiment_name))
+    env = Monitor(env, prepare_path(config.monitor_file, experiment_name=config.experiment_name))
     env.seed(config.seed)
     return env
 
@@ -398,9 +740,9 @@ def make_env(config):
 def interpret_boolean(param):
     if type(param) == bool:
         return param
-    elif param in ['True', '1']:
+    elif param in ['True', 'true', '1']:
         return True
-    elif param in ['False', '0']:
+    elif param in ['False', 'false', '0']:
         return False
     else:
         sys.exit("param '{}' cannot be interpreted as boolean".format(param))
@@ -408,18 +750,17 @@ def interpret_boolean(param):
 
 def get_env_parameters(env):
     # Get spaces parameters
-    state_dim = 0
-    state_dim += env.observation_space.spaces['observation'].shape[0]
-    state_dim += env.observation_space.spaces['desired_goal'].shape[0]
+    observation_dim = env.observation_space.spaces['observation'].shape[0]
+    goal_dim = env.observation_space.spaces['desired_goal'].shape[0]
 
     action_dim = env.action_space.shape[0]
     max_action_value = float(env.action_space.high[0])
 
-    return state_dim, action_dim, max_action_value
+    return observation_dim, goal_dim, action_dim, max_action_value
 
 
-def prepare_path(path, unique_id):
-    return os.path.join(ROOT_DIR_PATH, unique_id, path)
+def prepare_path(path, **args):
+    return os.path.join(ROOT_DIR_PATH, path.format(**args))
 
 
 def set_random_seed(seed: int, device: str = 'cpu') -> None:
@@ -443,11 +784,10 @@ def train_agent_according_config(config):
     print(f'Actions count: {env.action_space.shape}')
     print(f'Action UB:   {float(env.action_space.high[0])}')
     print(f'Action LB: {float(env.action_space.low[0])}')
+    print(f'Action LB: {float(env._max_episode_steps)}')
 
-    # todo tensorboard writer
     # todo noise
     # todo her
-    # todo gif
 
 
 if __name__ == '__main__':
