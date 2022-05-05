@@ -10,3 +10,5 @@ random_eps: 0.3
 # HER
 replay_strategy: future
 replay_k: 4
+
+polyak: 0.95

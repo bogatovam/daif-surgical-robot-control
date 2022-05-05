@@ -14,4 +14,4 @@ model_path: models\{experiment_name}
 model_save_timer: 500
 
 should_save_episode_video: true
-episode_video_timer: 10
+episode_video_timer: 5

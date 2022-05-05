@@ -358,6 +358,8 @@ class Agent:
 
         self.device = config.device_id
 
+        self.polyak = int(config.polyak)
+
         self.n_epochs = int(config.n_epochs)
         self.n_cycles = int(config.n_cycles)
         self.n_batches = int(config.n_batches)
@@ -417,31 +419,28 @@ class Agent:
 
     def get_mini_batches(self):
         # Retrieve transition data in mini batches
-        all_obs_batch, all_actions_batch, reward_batch_t1, done_batch_t2 = self.buffer.sample(self.batch_size)
+        t0, t1, t2, reward_batch, done_batch = self.buffer.sample(self.batch_size)
 
-        (observation_batch, achieved_goal_batch, desired_goal_batch,
-         actions_batch, _, _, reward_batch_t1, done_batch_t2) = self.buffer.sample(self.batch_size)
+        # Retrieve a batch for 3 consecutive points in time
+        (observation_batch_t0, achieved_goal_batch_t0, desired_goal_batch_t0, actions_batch_t0) = t0
+        (observation_batch_t1, achieved_goal_batch_t1, desired_goal_batch_t1, actions_batch_t1) = t1
+        (observation_batch_t2, achieved_goal_batch_t2, desired_goal_batch_t2, actions_batch_t2) = t2
 
-        # Retrieve a batch of observations for 3 consecutive points in time
-        obs_batch_t0 = all_obs_batch[:, 0].view([self.batch_size] + [dim for dim in self.state_shape])
-        obs_batch_t1 = all_obs_batch[:, 1].view([self.batch_size] + [dim for dim in self.state_shape])
-        obs_batch_t2 = all_obs_batch[:, 2].view([self.batch_size] + [dim for dim in self.state_shape])
-
-        # Retrieve the agent's action history for time t0 and time t1
-        action_batch_t0 = all_actions_batch[:, 0]
-        action_batch_t1 = all_actions_batch[:, 1]
+        state_batch_t0 = torch.cat((observation_batch_t0, desired_goal_batch_t0), dim=1)
+        state_batch_t1 = torch.cat((observation_batch_t1, desired_goal_batch_t1), dim=1)
+        state_batch_t2 = torch.cat((observation_batch_t2, desired_goal_batch_t2), dim=1)
 
         # At time t0 predict the state at time t1:
         # append actions vector nearby state
-        X = torch.cat((obs_batch_t0, action_batch_t0), dim=1)
+        X = torch.cat((state_batch_t0, desired_goal_batch_t0), dim=1)
         pred_batch_t0t1 = self.transition_net(X)
 
         # Determine the prediction error wrt time t0-t1:
         pred_error_batch_t0t1 = torch.mean(F.mse_loss(
-            pred_batch_t0t1, obs_batch_t1, reduction='none'), dim=1).unsqueeze(1)
+            pred_batch_t0t1, state_batch_t1, reduction='none'), dim=1).unsqueeze(1)
 
-        return (obs_batch_t0, obs_batch_t1, obs_batch_t2, action_batch_t0,
-                action_batch_t1, reward_batch_t1, done_batch_t2, pred_error_batch_t0t1)
+        return (state_batch_t0, state_batch_t1, state_batch_t2, actions_batch_t0,
+                actions_batch_t1, reward_batch, done_batch, pred_error_batch_t0t1)
 
     def compute_value_net_loss(self, obs_batch_t1, obs_batch_t2,
                                action_batch_t1, reward_batch_t1,
@@ -505,54 +504,7 @@ class Agent:
 
         return vfe
 
-    # update the network
     def _update_network(self):
-        # sample the episodes
-        (all_obs_batch, all_desired_goal_batch, all_actions_batch,
-         reward_batch_t1, done_batch_t2) = self.buffer.sample(self.batch_size)
-
-        current_input_tensor = self._preprocess_inputs(transitions['observation'], transitions['desired_goal'])
-        next_input_tensor = self._preprocess_inputs(transitions['next_observation'], transitions['desired_goal'])
-
-        actions_tensor = torch.tensor(transitions['actions'], dtype=torch.float32, device=self.device).unsqueeze(0)
-        reward_tensor = torch.tensor(transitions['reward'], dtype=torch.float32, device=self.device).unsqueeze(0)
-
-        # calculate the target Q value function
-        with torch.no_grad():
-            # do the normalization
-            # concatenate the stuffs
-            actions_next = self.actor_target_network(inputs_next_norm_tensor)
-            q_next_value = self.critic_target_network(inputs_next_norm_tensor, actions_next)
-            q_next_value = q_next_value.detach()
-            target_q_value = reward_tensor + self.args.gamma * q_next_value
-            target_q_value = target_q_value.detach()
-            # clip the q value
-            clip_return = 1 / (1 - self.args.gamma)
-            target_q_value = torch.clamp(target_q_value, -clip_return, 0)
-
-        # the q loss
-        real_q_value = self.critic_network(inputs_norm_tensor, actions_tensor)
-        critic_loss = (target_q_value - real_q_value).pow(2).mean()
-        # the actor loss
-        actions_real = self.actor_network(inputs_norm_tensor)
-        actor_loss = -self.critic_network(inputs_norm_tensor, actions_real).mean()
-        actor_loss += self.args.action_l2 * (actions_real / self.env_params['action_max']).pow(2).mean()
-        # start to update the network
-        self.actor_optim.zero_grad()
-        actor_loss.backward()
-        sync_grads(self.actor_network)
-        self.actor_optim.step()
-        # update the critic_network
-        self.critic_optim.zero_grad()
-        critic_loss.backward()
-        sync_grads(self.critic_network)
-        self.critic_optim.step()
-
-    def learn(self):
-        # If there are not enough transitions stored in memory, return:
-        if self.memory.push_count - self.max_n_indices * 2 < self.batch_size:
-            return
-
         # Retrieve transition data in mini batches:
         (obs_batch_t0, obs_batch_t1, obs_batch_t2, action_batch_t0,
          action_batch_t1, reward_batch_t1, done_batch_t2,
@@ -575,6 +527,11 @@ class Agent:
         vfe.backward()
         value_net_loss.backward()
 
+        # todo check this (from her)
+        # actor_loss += self.args.action_l2 * (actions_real / self.env_params['action_max']).pow(2).mean()
+        # clip the q value
+        # clip_return = 1 / (1 - self.args.gamma)
+        # target_q_value = torch.clamp(target_q_value, -clip_return, 0)
         # Perform gradient descent:
         self.transition_net.optimizer.step()
         self.prediction_policy_mu_network.optimizer.step()
@@ -584,10 +541,50 @@ class Agent:
         self.metrics.update('vfe', vfe.item())
         self.metrics.update('efe_mse_loss', value_net_loss.item())
 
+    # soft update
+    def _soft_update_target_network(self, target, source):
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_((1 - self.polyak) * param.data + self.polyak * target_param.data)
+
+    # do the evaluation
+    def _eval_agent(self, epoch):
+        images = []
+        total_reward = []
+        total_success_rate = []
+
+        for cycle in range(10):
+            per_reward = []
+            per_success_rate = []
+
+            observation, _, desired_goal, _, reward = self._reset()
+
+            for _ in range(self._max_episode_steps):
+                input_tensor = self._preprocess_inputs(observation, desired_goal)
+                action = self._select_action(input_tensor)
+
+                # feed the actions into the environment
+                new_observation, reward, _, info = self.env.step(action)
+
+                observation = new_observation['observation']
+                per_reward.append(reward)
+                per_success_rate.append(info['is_success'])
+
+                if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
+                    images += [self.env.render()]
+
+            total_reward.append(np.mean(per_reward))
+            total_success_rate.append(np.mean(per_success_rate))
+
+        total_reward = np.asarray(total_reward)
+        total_success_rate = np.asarray(total_success_rate)
+        return np.mean(total_success_rate), np.mean(total_reward), images
+
     def train(self):
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.datetime.now()))
 
         for epoch in range(self.n_epochs):
+            self.writer.set_step(epoch)
+
             for _ in range(self.n_cycles):
 
                 observation, achieved_goal, desired_goal, done, reward = self._reset()
@@ -617,51 +614,21 @@ class Agent:
                     # train the network
                     self._update_network()
                 # soft update
-                self._soft_update_target_network(self.actor_target_network, self.actor_network)
-                self._soft_update_target_network(self.critic_target_network, self.critic_network)
+                self._soft_update_target_network(self.target_net, self.value_net)
+
             # start to do the evaluation
-            success_rate = self._eval_agent()
+            val_success_rate, val_reward, images = self._eval_agent(epoch)
 
-        for episode in range(self.n_episodes):
-            self.writer.set_step(episode)
+            self.metrics.update('success_rate', val_success_rate)
+            self.metrics.update('reward', val_reward)
 
-            results = {'reward': [], 'done': [], 'images': []}
+            if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
+                self.writer.add_video(self.experiment_name + f'_{epoch}', images)
 
-            obs, done, reward = self.reset()
+            if epoch > 0 and epoch % self.print_timer == 0:
+                print("Epoch: {:4d}, avg score: {:3.2f}, over last {:d}".format(epoch, val_reward, self.print_timer))
 
-            while not done:
-                action = self.select_action(obs)
-                self.memory.push(obs, action, reward, done)
-
-                obs, reward, done, _ = self.env.step(action.cpu().data.numpy())
-                obs, reward, done = self.preprocess_step_results(obs, reward, done)
-
-                results['reward'] += [reward]
-                results['done'] += [done]
-                if self.should_save_episode_video and episode % self.episode_video_timer == 0:
-                    results['done'] += [self.env.render()]
-
-                # todo is it stable?
-                self.learn()
-                if done:
-                    self.memory.push(obs, -99, -99, done)
-
-            # Print and keep a (.txt) record of stuff
-            avg_reward = np.mean(results['reward'])
-            success_rate = np.mean(results['done'])
-
-            self.metrics.update('success_rate', success_rate)
-            self.metrics.update('reward', avg_reward)
-
-            if self.should_save_episode_video and episode % self.episode_video_timer == 0:
-                self.writer.add_video(self.experiment_name + f'_{episode}', results['images'])
-
-            if episode > 0 and episode % self.print_timer == 0:
-                last_x = np.mean(results[-self.print_timer:])
-
-                print("Episodes: {:4d}, avg score: {:3.2f}, over last {:d}: {:3.2f}".format(episode, avg_reward,
-                                                                                            self.print_timer, last_x))
-            if self.should_save_model and episode > 0 and episode % self.model_save_timer == 0:
+            if self.should_save_model and epoch > 0 and epoch % self.model_save_timer == 0:
                 self.transition_net.save(os.path.join(self.model_path, 'transition_net.pth'))
                 self.prediction_policy_mu_network.save(os.path.join(self.model_path, 'policy_mu_network.pth'))
                 self.prediction_policy_logstd_network.save(os.path.join(self.model_path, 'policy_logstd_network.pth'))
