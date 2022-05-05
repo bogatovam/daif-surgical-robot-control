@@ -143,7 +143,7 @@ class ReplayBuffer:
 
         self.actions_memory = torch.empty([self.size, self.max_episode_steps, self.action_dim],
                                           dtype=torch.float32, device=self.device)
-        self.done_memory = torch.empty([self.size, self.max_episode_steps, 1], dtype=torch.int8, device=self.device)
+        # self.done_memory = torch.empty([self.size, self.max_episode_steps, 1], dtype=torch.int8, device=self.device)
 
         # thread lock
         self.lock = threading.Lock()
@@ -166,20 +166,10 @@ class ReplayBuffer:
         achieved_goal_buffer = self.achieved_goal_memory[:self.current_size]
         desired_goal_buffer = self.desired_goal_memory[:self.current_size]
         actions_buffer = self.actions_memory[:self.current_size]
-        next_observation_buffer = observation_buffer[:, 1:, :]
-        next_achieved_goal_buffer = achieved_goal_buffer[:, 1:, :]
-
-        temp_buffers = {}
-        with self.lock:
-            for key in self.buffers.keys():
-                temp_buffers[key] = self.buffers[key][:self.current_size]
-        temp_buffers['next_observation'] = temp_buffers['observation'][:, 1:, :]
-        temp_buffers['next_achieved_goal'] = temp_buffers['achieved_goal'][:, 1:, :]
 
         return self.sample_func(observation_buffer,
                                 achieved_goal_buffer, desired_goal_buffer,
                                 actions_buffer,
-                                next_observation_buffer, next_achieved_goal_buffer,
                                 batch_size)
 
     def _get_storage_idx(self, inc=None):
@@ -200,7 +190,7 @@ class ReplayBuffer:
 
 
 class HERSampler:
-    def __init__(self, replay_strategy, replay_k, reward_func=None):
+    def __init__(self, replay_strategy, replay_k, reward_func=None, done_func=None):
         self.replay_strategy = replay_strategy
         self.replay_k = replay_k
         if self.replay_strategy == 'future':
@@ -208,29 +198,87 @@ class HERSampler:
         else:
             self.future_p = 0
         self.reward_func = reward_func
+        self.done_func = done_func
 
-    def sample_her_transitions(self, episode_batch, batch_size_in_transitions):
-        T = episode_batch['actions'].shape[1]
-        rollout_batch_size = episode_batch['actions'].shape[0]
-        batch_size = batch_size_in_transitions
-        # select which rollouts and which timesteps to be used
-        episode_idxs = np.random.randint(0, rollout_batch_size, batch_size)
-        t_samples = np.random.randint(T, size=batch_size)
-        transitions = {key: episode_batch[key][episode_idxs, t_samples].copy() for key in episode_batch.keys()}
+        # When sampling from memory at index i, obs_indices indicates that we want observations
+        # with indices i-obs_indices, works the same for the others
+        self.obs_indices = [2, 1, 0]
+        self.action_indices = [2, 1]
+        self.reward_indices = [1]
+        self.done_indices = [0]
+        self.max_n_indices = max(max(self.obs_indices, self.action_indices, self.reward_indices, self.done_indices)) + 1
+
+    def sample_her_transitions(self, observation_buffer,
+                               achieved_goal_buffer, desired_goal_buffer,
+                               actions_buffer, batch_size):
+        # Trajectory length
+        trajectory_length = actions_buffer.shape[1]
+
+        # Buffer size
+        buffer_length = actions_buffer.shape[0]
+
+        # generate ids which trajectories to use
+        episode_ids = np.random.randint(low=0, high=buffer_length - 2, size=batch_size)
+
+        # generate ids which timestamps to use
+        # - 2 because we sample for 3 sequential timestamps
+        t_samples = np.random.randint(low=0, high=trajectory_length - 2, size=batch_size)
+
         # her idx
         her_indexes = np.where(np.random.uniform(size=batch_size) < self.future_p)
-        future_offset = np.random.uniform(size=batch_size) * (T - t_samples)
+
+        # previous
+        t0 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
+                                   episode_ids, t_samples, her_indexes,
+                                   batch_size=batch_size, time=0)
+        # current
+        t1 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
+                                   episode_ids, t_samples, her_indexes,
+                                   batch_size=batch_size, time=1)
+        # next
+        t2 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
+                                   episode_ids, t_samples, her_indexes,
+                                   batch_size=batch_size, time=2)
+
+        (_, achieved_goal_batch_t2, desired_goal_batch_t2, _) = t2
+        # Recompute the reward for the augmented 'desired_goal'
+        reward_batch = self.reward_func(achieved_goal_batch_t2, desired_goal_batch_t2)
+        # Recompute the termination state for the augmented 'desired_goal'
+        done_batch = self.done_func(achieved_goal_batch_t2, desired_goal_batch_t2)
+
+        # Reshape the batch
+        reward_batch = reward_batch.reshape(batch_size, *reward_batch.shape[1:])
+        done_batch = done_batch.reshape(batch_size, *done_batch.shape[1:])
+
+        return t0, t1, t2, reward_batch, done_batch
+
+    def _sample_for_time(self, observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
+                         episode_idxs, t_samples, her_indexes, batch_size, time):
+        # Trajectory length
+        trajectory_length = actions_buffer.shape[1]
+
+        observation_batch = observation_buffer[:, time:, :][episode_idxs, t_samples].copy()
+        achieved_goal_batch = achieved_goal_buffer[:, time:, :][episode_idxs, t_samples].copy()
+        desired_goal_batch = desired_goal_buffer[:, time:, :][episode_idxs, t_samples].copy()
+        actions_batch = actions_buffer[:, time:, :][episode_idxs, t_samples].copy()
+
+        # Reshape the batch
+        observation_batch = observation_batch.reshape(batch_size, *observation_batch.shape[1:])
+        achieved_goal_batch = achieved_goal_batch.reshape(batch_size, *achieved_goal_batch.shape[1:])
+        desired_goal_batch = desired_goal_batch.reshape(batch_size, *desired_goal_batch.shape[1:])
+        actions_batch = actions_batch.reshape(batch_size, *actions_batch.shape[1:])
+
+        # Sample 'future' timestamps for each 't_samples'
+        future_offset = np.random.uniform(size=batch_size) * (trajectory_length - t_samples)
         future_offset = future_offset.astype(int)
         future_t = (t_samples + 1 + future_offset)[her_indexes]
-        # replace go with achieved goal
-        future_ag = episode_batch['achieved_goal'][episode_idxs[her_indexes], future_t]
-        transitions['desired_goal'][her_indexes] = future_ag
-        # to get the params to re-compute reward
-        transitions['reward'] = np.expand_dims(
-            self.reward_func(transitions['next_achieved_goal'], transitions['desired_goal'], None), 1)
-        transitions = {k: transitions[k].reshape(batch_size, *transitions[k].shape[1:]) for k in transitions.keys()}
 
-        return transitions
+        # Get the achieved_goal at the 'future' timestamps
+        next_achieved_goal = achieved_goal_buffer[:, time:, :][episode_idxs[her_indexes], future_t]
+        # Replace the 'desired_goal' with the 'next_achieved_goal'
+        desired_goal_batch[her_indexes] = next_achieved_goal
+
+        return observation_batch, achieved_goal_batch, desired_goal_batch, actions_batch
 
 
 class Normalizer:
@@ -354,7 +402,8 @@ class Agent:
         self.value_net = MLP(self.state_size + self.action_dim, [64] * 2, 1)
         self.target_net = MLP(self.state_size + self.action_dim, [64] * 2, 1)
 
-        self.her_module = HERSampler(config.replay_strategy, config.replay_k, self.env.compute_reward)
+        self.her_module = HERSampler(config.replay_strategy, config.replay_k, self.env.compute_reward,
+                                     self.env.is_success)
         # create the replay buffer
         self.buffer = ReplayBuffer(self.env, config.max_episode_steps, self.memory_capacity,
                                    self.her_module.sample_her_transitions, config.device_id)
@@ -362,23 +411,16 @@ class Agent:
         self.o_norm = Normalizer(size=env.observation_space.spaces['observation'].shape[0])
         self.g_norm = Normalizer(size=env.observation_space.spaces['desired_goal'].shape[0])
 
-        # When sampling from memory at index i, obs_indices indicates that we want observations
-        # with indices i-obs_indices, works the same for the others
-        self.obs_indices = [2, 1, 0]
-        self.action_indices = [2, 1]
-        self.reward_indices = [1]
-        self.done_indices = [0]
-        self.max_n_indices = max(max(self.obs_indices, self.action_indices, self.reward_indices, self.done_indices)) + 1
-
         self.writer = TensorboardWriter(config.log_dir, True)
 
         self.metrics = MetricTracker('vfe', 'efe_mse_loss', 'success_rate', 'reward', writer=self.writer)
 
     def get_mini_batches(self):
         # Retrieve transition data in mini batches
-        all_obs_batch, all_actions_batch, reward_batch_t1, done_batch_t2 = self.memory.sample(
-            self.obs_indices, self.action_indices, self.reward_indices,
-            self.done_indices, self.max_n_indices, self.batch_size)
+        all_obs_batch, all_actions_batch, reward_batch_t1, done_batch_t2 = self.buffer.sample(self.batch_size)
+
+        (observation_batch, achieved_goal_batch, desired_goal_batch,
+         actions_batch, _, _, reward_batch_t1, done_batch_t2) = self.buffer.sample(self.batch_size)
 
         # Retrieve a batch of observations for 3 consecutive points in time
         obs_batch_t0 = all_obs_batch[:, 0].view([self.batch_size] + [dim for dim in self.state_shape])
@@ -698,36 +740,23 @@ class Agent:
         g = np.clip(g, -200, 200)
         return o, g
 
-    def _update_normalizer(self, observation, achieved_goal, desired_goal, action):
-        next_observation = observation[:, 1:, :]
-        next_achieved_goal = achieved_goal[:, 1:, :]
-
+    def _update_normalizer(self, observation, achieved_goal, desired_goal, actions):
         # get the number of normalization transitions
-        num_transitions = action.shape[1]
+        num_transitions = actions.shape[1]
         # create the new buffer to store them
-        buffer_temp = {'observation': observation,
-                       'achieved_goal': achieved_goal,
-                       'desired_goal': desired_goal,
-                       'actions': action,
-                       'next_observation': next_observation,
-                       'next_achieved_goal': next_achieved_goal,
-                       }
 
-        transitions = self.her_module.sample_her_transitions(buffer_temp, num_transitions)
-        obs, g = transitions['observation'], transitions['desired_goal']
-        transitions['observation'], transitions['desired_goal'] = self._preprocess_observation_and_goal(obs, g)
+        (observation_batch, _, desired_goal_batch, _, _, _, _, _) = \
+            self.her_module.sample_her_transitions(observation, achieved_goal, desired_goal,
+                                                   actions, num_transitions)
+
+        observation_batch, desired_goal_batch = self._preprocess_observation_and_goal(observation_batch,
+                                                                                      desired_goal_batch)
         # update
-        self.o_norm.update(transitions['observation'])
-        self.g_norm.update(transitions['desired_goal'])
+        self.o_norm.update(observation_batch)
+        self.g_norm.update(desired_goal_batch)
         # recompute the stats
         self.o_norm.recompute_stats()
         self.g_norm.recompute_stats()
-
-    def preprocess_step_results(self, obs, reward, done):
-        done = bool(done)
-        obs = preprocess_obs(obs)
-        obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
-        return obs, reward, done
 
 
 def make_env(config):
