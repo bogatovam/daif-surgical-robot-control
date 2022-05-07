@@ -1,4 +1,3 @@
-import datetime
 import os.path
 import random
 import sys
@@ -18,6 +17,23 @@ import gym
 from config.const import ROOT_DIR_PATH
 from logger import TensorboardWriter
 from utils import MetricTracker
+
+import threading
+import numpy as np
+from datetime import datetime
+import os.path
+import random
+import sys
+import gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
+
+import gym
 
 import threading
 import numpy as np
@@ -360,7 +376,7 @@ class Agent:
                               self.n_sampled_actions, device=self.device)
 
         self.her_module = HERSampler(config.replay_strategy, config.replay_k, self.env.compute_reward,
-                                     self.env.is_success)
+                                     self.env.compute_reward)
         # create the replay buffer
         self.buffer = ReplayBuffer(self.env, config.max_episode_steps, self.memory_capacity,
                                    self.her_module.sample_her_transitions, config.device_id)
@@ -542,8 +558,8 @@ class Agent:
                 per_reward.append(reward)
                 per_success_rate.append(info['is_success'])
 
-                if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
-                    images += [self.env.render()]
+                # if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
+                #     images += [self.env.render()]
 
             total_reward.append(np.mean(per_reward))
             total_success_rate.append(np.mean(per_success_rate))
@@ -553,14 +569,14 @@ class Agent:
         return np.mean(total_success_rate), np.mean(total_reward), np.asarray(images)
 
     def train(self):
-        print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.datetime.now()))
+        print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
         for epoch in range(self.n_epochs):
             for step in range(self.n_cycles):
                 self.writer.set_step(self.n_cycles * epoch + step)
 
                 cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
-                for _ in range(self.n_episodes):
+                for _ in range(self.n_batches):
                     observation, achieved_goal, desired_goal, done, reward = self._reset()
 
                     episode_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
@@ -591,7 +607,7 @@ class Agent:
                 cycle_data['action'] = np.asarray(cycle_data['action'], dtype=np.float32)
 
                 # store the episodes
-                self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_episodes)
+                self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_batches)
                 self._update_normalizer(**cycle_data)
 
                 vfe = []
@@ -638,7 +654,7 @@ class Agent:
             self.value_net.save(os.path.join(self.final_model_path, 'value_net.pth'))
 
         # Print and keep a (.txt) record of stuff
-        print("Training finished at {}".format(datetime.datetime.now()))
+        print("Training finished at {}".format(datetime.now()))
 
     def log_models_parameters(self):
         # add histogram of model parameters to the tensorboard
@@ -726,7 +742,7 @@ class Agent:
 
 
 def make_env(config):
-    env = gym.make(config.env_id, render_mode=config.render_mode)
+    env = gym.make(config.env_id)
     # env = Monitor(env, prepare_path(config.monitor_file, experiment_name=config.experiment_name))
     env.seed(config.seed)
     return env
@@ -766,7 +782,7 @@ def set_random_seed(seed: int, device: str = 'cpu') -> None:
     # seed the RNG for all devices (both CPU and CUDA)
     torch.manual_seed(seed)
 
-    if device == 'gpu':
+    if device == 'cuda':
         # Deterministic operations for CuDNN, it may impact performances
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
