@@ -2,8 +2,8 @@ import torch.nn as nn
 import numpy as np
 from abc import abstractmethod
 import torch
-from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from stable_baselines3.common.utils import get_device
+from typing import Union
 import warnings
 
 

@@ -2,8 +2,6 @@ import datetime
 import os.path
 import random
 import sys
-import gym
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
