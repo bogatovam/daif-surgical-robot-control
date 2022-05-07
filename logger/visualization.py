@@ -31,7 +31,7 @@ class TensorboardWriter():
         self.mode = ''
 
         self.tb_writer_ftns = {
-            'add_scalar', 'add_scalars', 'add_image', 'add_images', 'add_audio',
+            'add_scalar', 'add_scalars', 'add_image', 'add_video', 'add_images', 'add_audio',
             'add_text', 'add_histogram', 'add_pr_curve', 'add_embedding'
         }
         self.tag_mode_exceptions = {'add_histogram', 'add_embedding'}
