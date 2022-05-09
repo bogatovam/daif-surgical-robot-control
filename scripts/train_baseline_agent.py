@@ -1,3 +1,4 @@
+import math
 import os.path
 import random
 import sys
@@ -9,6 +10,7 @@ import torch.optim as optim
 import surrol.gym as surrol_gym
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
+from torch.distributions import Normal
 
 from base import BaseModel
 from config.configs_reader import get_config
@@ -21,6 +23,23 @@ from utils import MetricTracker
 import threading
 import numpy as np
 from datetime import datetime
+import os.path
+import random
+import sys
+import gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
+
+import gym
+
+import threading
+import numpy as np
+
 import os.path
 import random
 import sys
@@ -289,11 +308,11 @@ class Normalizer:
     def normalize(self, v, clip_range=None):
         if clip_range is None:
             clip_range = self.default_clip_range
-        return np.clip((v - self.mean) / (self.std), -clip_range, clip_range)
+        return np.clip((v - self.mean) / self.std, -clip_range, clip_range)
 
 
 class MLP(BaseModel):
-    def __init__(self, input_size, layer_sizes, output_size, lr=1e-3, output_activation=torch.nn.Identity,
+    def __init__(self, input_size, layer_sizes, output_size, lr=0.001, output_activation=torch.nn.Identity,
                  activation=torch.nn.ELU, device='cpu'):
         super(MLP, self).__init__()
         sizes = [input_size] + layer_sizes + [output_size]
@@ -362,18 +381,18 @@ class Agent:
         self.n_sampled_actions = config.n_sampled_actions
         self.freeze_cntr = 0
 
-        self.transition_net = MLP(self.state_size + self.action_dim, [64, 64], self.state_size, lr=1e-3,
+        self.transition_net = MLP(self.state_size + self.action_dim, [64, 64], self.state_size, lr=0.001,
                                   device=self.device)
 
         self.prediction_policy_mu_network = MLP(self.state_size, [64] * 2, self.action_dim, device=self.device)
         self.prediction_policy_logstd_network = MLP(self.state_size, [64] * 2, self.action_dim, device=self.device)
 
-        self.value_net = MLP(self.n_sampled_actions * (self.state_size + self.action_dim),
-                             [1024] + [512] + [256] + [64] * 2,
-                             self.n_sampled_actions, device=self.device)
-        self.target_net = MLP(self.n_sampled_actions * (self.state_size + self.action_dim),
-                              [1024] + [512] + [256] + [64] * 2,
-                              self.n_sampled_actions, device=self.device)
+        self.value_net = MLP(self.state_size + self.action_dim,
+                             [64] + [32],
+                             1, device=self.device)
+        self.target_net = MLP(self.state_size + self.action_dim,
+                              [64] + [32],
+                              1, device=self.device)
 
         self.her_module = HERSampler(config.replay_strategy, config.replay_k, self.env.compute_reward,
                                      self.env.compute_reward)
@@ -398,9 +417,9 @@ class Agent:
         (observation_batch_t1, achieved_goal_batch_t1, desired_goal_batch_t1, actions_batch_t1) = t1
         (observation_batch_t2, achieved_goal_batch_t2, desired_goal_batch_t2, actions_batch_t2) = t2
 
-        state_batch_t0 = torch.cat((self.as_tensor(observation_batch_t0), self.as_tensor(desired_goal_batch_t0)), dim=1)
-        state_batch_t1 = torch.cat((self.as_tensor(observation_batch_t1), self.as_tensor(desired_goal_batch_t1)), dim=1)
-        state_batch_t2 = torch.cat((self.as_tensor(observation_batch_t2), self.as_tensor(desired_goal_batch_t2)), dim=1)
+        state_batch_t0 = self._preprocess_batch_inputs(observation_batch_t0, desired_goal_batch_t0)
+        state_batch_t1 = self._preprocess_batch_inputs(observation_batch_t1, desired_goal_batch_t1)
+        state_batch_t2 = self._preprocess_batch_inputs(observation_batch_t2, desired_goal_batch_t2)
 
         actions_batch_t0, actions_batch_t1 = self.as_tensor(actions_batch_t0), self.as_tensor(actions_batch_t1)
         reward_batch, done_batch = self.as_tensor(reward_batch), self.as_tensor(done_batch)
@@ -417,76 +436,80 @@ class Agent:
         return (state_batch_t0, state_batch_t1, state_batch_t2, actions_batch_t0,
                 actions_batch_t1, reward_batch, done_batch, pred_error_batch_t0t1)
 
-    def compute_value_net_loss(self, obs_batch_t1, obs_batch_t2,
+    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
                                action_batch_t1, reward_batch_t1,
                                done_batch_t2, pred_error_batch_t0t1):
 
         with torch.no_grad():
             # Determine the action distribution for time t2:
-            mu_t2, std_t2 = self.prediction(obs_batch_t2)
-
-            distribution = torch.distributions.normal.Normal(loc=mu_t2, scale=torch.exp(std_t2))
-            sampled_actions_batch_t2 = distribution.sample(sample_shape=[self.n_sampled_actions])
+            _, _, sampled_actions_batch_t2, probs_t2 = self._sample_actions_with_probs(state_batch_t2,
+                                                                                       self.n_sampled_actions)
 
             # Determine the target EFEs for time t2:
-            repeated_obs_batch = obs_batch_t2.unsqueeze(1).repeat(1, self.n_sampled_actions, 1)
-            targe_net_input = torch.cat([repeated_obs_batch, sampled_actions_batch_t2.transpose(0, 1)], dim=2)
-            targe_net_input = torch.flatten(targe_net_input, start_dim=1)
+            repeated_obs_batch = state_batch_t2.unsqueeze(1).repeat(1, self.n_sampled_actions, 1)
+            targe_net_input = torch.cat([repeated_obs_batch, sampled_actions_batch_t2], dim=2)
+
+            source_shape = targe_net_input.shape
+            targe_net_input = torch.reshape(targe_net_input,
+                                            shape=(source_shape[0] * source_shape[1], source_shape[2]))
+
             target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
 
-            # todo better way?
-            probs = torch.exp(distribution.log_prob(sampled_actions_batch_t2).transpose(0, 1).sum(2))
+            target_expected_free_energies_batch_t2 = target_expected_free_energies_batch_t2.reshape(source_shape[0],
+                                                                                                    source_shape[1])
             # Weigh the target EFEs according to the action distribution:
-            weighted_targets = (probs * target_expected_free_energies_batch_t2).sum(-1).unsqueeze(1)
+            weighted_targets = (probs_t2 * target_expected_free_energies_batch_t2).sum(-1).unsqueeze(1)
 
             # Determine the batch of bootstrapped estimates of the EFEs:
             expected_free_energy_estimate_batch = (
                     -reward_batch_t1 + pred_error_batch_t0t1 + self.beta * weighted_targets)
 
-        mu_t1, std_t1 = self.prediction(obs_batch_t1)
-        distribution = torch.distributions.normal.Normal(loc=mu_t1, scale=torch.exp(std_t1))
-        sampled_actions_batch_t1 = distribution.sample(sample_shape=[self.n_sampled_actions])
+        _, _, sampled_actions_batch_t1, probs_t1 = self._sample_actions_with_probs(state_batch_t1,
+                                                                                   self.n_sampled_actions)
 
         # Determine the Expected free energy at time t1 according to the value network:
-        repeated_obs_batch = obs_batch_t1.unsqueeze(1).repeat(1, self.n_sampled_actions, 1)
-        value_net_input = torch.cat([repeated_obs_batch, sampled_actions_batch_t1.transpose(0, 1)], dim=2)
-        value_net_input = torch.flatten(value_net_input, start_dim=1)
+        repeated_obs_batch = state_batch_t1.unsqueeze(1).repeat(1, self.n_sampled_actions, 1)
+        value_net_input = torch.cat([repeated_obs_batch, sampled_actions_batch_t1], dim=2)
+        source_shape = value_net_input.shape
+        value_net_input = torch.reshape(value_net_input,
+                                        shape=(source_shape[0] * source_shape[1], source_shape[2]))
 
-        probs = torch.exp(distribution.log_prob(sampled_actions_batch_t1).transpose(0, 1).sum(2))
+        value_net_output = self.value_net(value_net_input)
+        value_net_output = value_net_output.reshape(source_shape[0], source_shape[1])
 
-        efe_batch_t1 = (probs * self.value_net(value_net_input)).sum(-1).unsqueeze(1)
+        efe_batch_t1 = (probs_t1 * value_net_output).sum(-1).unsqueeze(1)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
         value_net_loss = F.mse_loss(expected_free_energy_estimate_batch, efe_batch_t1)
-
         return value_net_loss
 
-    def compute_variational_free_energy(self, obs_batch_t1, action_batch_t1, pred_error_batch_t0t1):
+    def compute_variational_free_energy(self, state_batch_t1, action_batch_t1, pred_error_batch_t0t1):
         # Determine the action distribution for time t1:
-        # policy_batch_t1 = self.policy_net(obs_batch_t1)
-
-        mu_t1, std_t1 = self.prediction(obs_batch_t1)
-        distribution = torch.distributions.normal.Normal(loc=mu_t1, scale=torch.exp(std_t1))
-        sampled_actions_batch_t1 = distribution.sample(sample_shape=[self.n_sampled_actions])
+        _, log_var, sampled_actions_batch_t1, probs_t1 = self._sample_actions_with_probs(state_batch_t1,
+                                                                                         self.n_sampled_actions)
 
         # Determine the Expected free energy at time t1 according to the value network:
-        repeated_obs_batch = obs_batch_t1.unsqueeze(1).repeat(1, self.n_sampled_actions, 1)
-        value_net_input = torch.cat([repeated_obs_batch, sampled_actions_batch_t1.transpose(0, 1)], dim=2)
-        probs = torch.exp(distribution.log_prob(sampled_actions_batch_t1).transpose(0, 1).sum(2))
-        value_net_input = torch.flatten(value_net_input, start_dim=1)
+        repeated_obs_batch = state_batch_t1.unsqueeze(1).repeat(1, self.n_sampled_actions, 1)
+        value_net_input = torch.cat([repeated_obs_batch, sampled_actions_batch_t1], dim=2)
+
+        source_shape = value_net_input.shape
+        value_net_input = torch.reshape(value_net_input,
+                                        shape=(source_shape[0] * source_shape[1], source_shape[2]))
 
         expected_free_energy_t1 = self.value_net(value_net_input).detach()
+        expected_free_energy_t1 = expected_free_energy_t1.reshape(source_shape[0], source_shape[1])
 
         # Take a gamma-weighted Boltzmann distribution over the EFEs:
-        boltzmann_expected_free_energy_batch_t1 = torch.softmax(-self.gamma * expected_free_energy_t1, dim=1).clamp(
+        boltzmann_expected_free_energy_batch_t1 = torch.sigmoid(-self.gamma * expected_free_energy_t1).clamp(
             min=1e-9, max=1 - 1e-9)
 
         # Weigh them according to the action distribution:
-        energy_batch = -(probs * torch.log(boltzmann_expected_free_energy_batch_t1)).sum(-1).view(
+        energy_batch = -(probs_t1 * torch.log(boltzmann_expected_free_energy_batch_t1)).sum(1).view(
             self.batch_size, 1)
 
         # Determine the entropy of the action distribution
-        entropy_batch = -(distribution.entropy()).sum(-1).view(self.batch_size, 1)
+        entropy_batch = -(0.5 + 0.5 * math.log(2 * math.pi) + torch.log(self._variance2std(log_var))) \
+            .sum(-1).view(self.batch_size, 1)
 
         # Determine the Variable Free Energy, then take the mean over all batch samples:
         vfe_batch = pred_error_batch_t0t1 + (energy_batch - entropy_batch)
@@ -496,17 +519,15 @@ class Agent:
 
     def _update_network(self):
         # Retrieve transition data in mini batches:
-        (obs_batch_t0, obs_batch_t1, obs_batch_t2, action_batch_t0,
+        (state_batch_t0, state_batch_t1, state_batch_t2, action_batch_t0,
          action_batch_t1, reward_batch_t1, done_batch_t2,
          pred_error_batch_t0t1) = self.get_mini_batches()
-
         # Compute the value network loss:
-        value_net_loss = self.compute_value_net_loss(obs_batch_t1, obs_batch_t2,
+        value_net_loss = self.compute_value_net_loss(state_batch_t1, state_batch_t2,
                                                      action_batch_t1, reward_batch_t1,
                                                      done_batch_t2, pred_error_batch_t0t1)
-
         # Compute the variational free energy:
-        vfe = self.compute_variational_free_energy(obs_batch_t1, action_batch_t1, pred_error_batch_t0t1)
+        vfe = self.compute_variational_free_energy(state_batch_t1, action_batch_t1, pred_error_batch_t0t1)
         # Reset the gradients:
         self.transition_net.optimizer.zero_grad()
         self.prediction_policy_mu_network.optimizer.zero_grad()
@@ -549,7 +570,7 @@ class Agent:
 
             for _ in range(self._max_episode_steps):
                 input_tensor = self._preprocess_inputs(observation, desired_goal)
-                action = self._select_action(input_tensor)
+                action = self._select_action(input_tensor, random=False)
 
                 # feed the actions into the environment
                 new_observation, reward, _, info = self.env.step(action)
@@ -622,6 +643,8 @@ class Agent:
                 # soft update
                 self._soft_update_target_network(self.target_net, self.value_net)
                 val_success_rate, val_reward, images = self._eval_agent(epoch)
+                self.metrics.update('success_rate', val_success_rate)
+                self.metrics.update('reward', val_reward)
                 self.log_models_parameters()
 
                 print(
@@ -629,12 +652,6 @@ class Agent:
                                                                                                val_success_rate))
 
                 # plot_grad_flow(self.prediction_policy_mu_network.named_parameters())
-
-            # start to do the evaluation
-            val_success_rate, val_reward, images = self._eval_agent(epoch)
-
-            self.metrics.update('success_rate', val_success_rate)
-            self.metrics.update('reward', val_reward)
 
             # if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
             #     self.writer.add_video(self.experiment_name + f'_{epoch}', images)
@@ -681,21 +698,54 @@ class Agent:
 
         return observation, achieved_goal, desired_goal, False, 0
 
-    def _select_action(self, input_tensor):
+    def _select_action(self, input_tensor, use_exploration=True):
         with torch.no_grad():
             # Determine the action distribution given the current observation:
-            mu, std = self.prediction(input_tensor)
-            distribution = torch.distributions.normal.Normal(loc=mu, scale=torch.exp(std))
-            action = distribution.sample().squeeze(0).detach().cpu().numpy().flatten()
+            mu, log_variance = self.prediction(input_tensor)
+            return self._infer_action_using_reparameterization(mu, log_variance).detach().cpu().numpy().flatten()
+            # # add the gaussian
+            # if random:
+            #     action += self.noise_eps * self.action_max * np.random.randn(*action.shape)
+            #     action = np.clip(action, -self.action_max, self.action_max)
 
-            # add the gaussian
-            action += self.noise_eps * self.action_max * np.random.randn(*action.shape)
-            action = np.clip(action, -self.action_max, self.action_max)
-            # random actions...
-            random_actions = np.random.uniform(low=-self.action_max, high=self.action_max, size=self.action_dim)
-            # choose if use the random actions
-            action += np.random.binomial(1, self.random_eps, 1)[0] * (random_actions - action)
-            return action
+            # # random actions...
+            # random_actions = np.random.uniform(low=-self.action_max, high=self.action_max, size=self.action_dim)
+            # # choose if use the random actions
+            # action += np.random.binomial(1, self.random_eps, 1)[0] * (random_actions - action)
+
+    def _sample_actions_with_probs(self, input_tensor, n_samples):
+        # input_tensor.shape = (batch_size, obs_dim + desired_goal)
+        with torch.no_grad():
+            # Determine the action distribution given the current observation:
+            mu, log_variance = self.prediction(input_tensor)
+            # mu.shape = (batch_size, action_dim)
+
+            r_mu = mu.unsqueeze(1).repeat(1, n_samples, 1)
+            r_log_variance = log_variance.unsqueeze(1).repeat(1, n_samples, 1)
+            # r_mu.shape = (batch_size, n_samples, action_dim)
+
+            actions = self._infer_action_using_reparameterization(r_mu, r_log_variance)
+            # actions.shape = (batch_size, n_samples, action_dim)
+
+            return mu, log_variance, actions, torch.exp(
+                (self._log_prob(actions, r_mu, self._variance2std(r_log_variance))))
+
+    def _infer_action_using_reparameterization(self, mu, log_variance):
+        # Apply reparameterization trick
+        std = self._variance2std(log_variance)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    @staticmethod
+    def _variance2std(log_variance):
+        return torch.exp(0.5 * log_variance)
+
+    @staticmethod
+    def _log_prob(value, loc, scale):
+        # compute the variance
+        var = torch.pow(scale, 2)
+        log_scale = torch.log(scale)
+        return -((value - loc) ** 2) / (2 * var) - log_scale - math.log(math.sqrt(2 * math.pi))
 
     def prediction(self, input_tensor):
         mu = self.prediction_policy_mu_network(input_tensor)
@@ -705,11 +755,19 @@ class Agent:
 
     def _preprocess_inputs(self, observation, goal):
         observation, goal = self._preprocess_observation_and_goal(observation, goal)
-        obs_norm = self.o_norm.normalize(observation)
-        goal_norm = self.g_norm.normalize(goal)
+        # obs_norm = self.o_norm.normalize(observation)
+        # goal_norm = self.g_norm.normalize(goal)
         # concatenate the stuffs
-        inputs = np.concatenate([obs_norm, goal_norm])
+        inputs = np.concatenate([observation, goal])
         return torch.tensor(inputs, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+    def _preprocess_batch_inputs(self, observation_batch, goal_batch):
+        observation_batch, goal_batch = self._preprocess_observation_and_goal(observation_batch, goal_batch)
+        # obs_norm = self.o_norm.normalize(observation_batch)
+        # goal_norm = self.g_norm.normalize(goal_batch)
+        # concatenate the stuffs
+        inputs = np.concatenate([observation_batch, goal_batch], axis=1)
+        return torch.tensor(inputs, dtype=torch.float32, device=self.device)
 
     def _preprocess_observation_and_goal(self, o, g):
         o = np.clip(o, -200, 200)
@@ -720,8 +778,6 @@ class Agent:
         # get the number of normalization transitions
         num_transitions = action.shape[0]
         # create the new buffer to store them
-
-        # todo need to use at least tree experiments
         t0, t1, t2, reward_batch, done_batch = self.her_module.sample_her_transitions(observation, achieved_goal,
                                                                                       desired_goal, action,
                                                                                       num_transitions)
@@ -742,7 +798,7 @@ class Agent:
 
 
 def make_env(config):
-    env = gym.make(config.env_id)
+    env = gym.make(config.env_id, render_mode=config.render_mode)
     # env = Monitor(env, prepare_path(config.monitor_file, experiment_name=config.experiment_name))
     env.seed(config.seed)
     return env

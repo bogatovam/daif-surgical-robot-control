@@ -1,4 +1,4 @@
-experiment_name: baseline
+experiment_name: baseline-trik
 
 monitor_file: logs\{experiment_name}\monitor.csv
 tb_log_folder: logs\{experiment_name}\tensorboard
@@ -6,8 +6,8 @@ seed: 42
 
 n_epochs: 50
 n_cycles: 50
-n_batches: 40
-max_episode_steps: 50
+n_batches: 5
+max_episode_steps: 10
 n_episodes: 3
 
 should_save_model: true

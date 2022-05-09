@@ -1,4 +1,4 @@
 device_id: cpu
-render_mode: None
+render_mode: human
 memory_capacity: 65536
 batch_size: 256
