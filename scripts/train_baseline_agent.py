@@ -458,7 +458,7 @@ class Agent:
             target_expected_free_energies_batch_t2 = target_expected_free_energies_batch_t2.reshape(source_shape[0],
                                                                                                     source_shape[1])
             # Weigh the target EFEs according to the action distribution:
-            weighted_targets = (probs_t2 * target_expected_free_energies_batch_t2).sum(-1).unsqueeze(1)
+            weighted_targets = (probs_t2.sum(-1) * target_expected_free_energies_batch_t2).sum(-1).unsqueeze(1)
 
             # Determine the batch of bootstrapped estimates of the EFEs:
             expected_free_energy_estimate_batch = (
@@ -477,7 +477,7 @@ class Agent:
         value_net_output = self.value_net(value_net_input)
         value_net_output = value_net_output.reshape(source_shape[0], source_shape[1])
 
-        efe_batch_t1 = (probs_t1 * value_net_output).sum(-1).unsqueeze(1)
+        efe_batch_t1 = (probs_t1.sum(-1) * value_net_output).sum(-1).unsqueeze(1)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
         value_net_loss = F.mse_loss(expected_free_energy_estimate_batch, efe_batch_t1)
@@ -504,7 +504,7 @@ class Agent:
             min=1e-9, max=1 - 1e-9)
 
         # Weigh them according to the action distribution:
-        energy_batch = -(probs_t1 * torch.log(boltzmann_expected_free_energy_batch_t1)).sum(1).view(
+        energy_batch = -(probs_t1.sum(-1) * torch.log(boltzmann_expected_free_energy_batch_t1)).sum(1).view(
             self.batch_size, 1)
 
         # Determine the entropy of the action distribution
@@ -562,7 +562,7 @@ class Agent:
         total_reward = []
         total_success_rate = []
 
-        for cycle in range(10):
+        for cycle in range(1):
             per_reward = []
             per_success_rate = []
 
@@ -570,7 +570,7 @@ class Agent:
 
             for _ in range(self._max_episode_steps):
                 input_tensor = self._preprocess_inputs(observation, desired_goal)
-                action = self._select_action(input_tensor, random=False)
+                action = self._select_action(input_tensor)
 
                 # feed the actions into the environment
                 new_observation, reward, _, info = self.env.step(action)
@@ -715,20 +715,18 @@ class Agent:
 
     def _sample_actions_with_probs(self, input_tensor, n_samples):
         # input_tensor.shape = (batch_size, obs_dim + desired_goal)
-        with torch.no_grad():
-            # Determine the action distribution given the current observation:
-            mu, log_variance = self.prediction(input_tensor)
-            # mu.shape = (batch_size, action_dim)
+        # Determine the action distribution given the current observation:
+        mu, log_variance = self.prediction(input_tensor)
+        # mu.shape = (batch_size, action_dim)
 
-            r_mu = mu.unsqueeze(1).repeat(1, n_samples, 1)
-            r_log_variance = log_variance.unsqueeze(1).repeat(1, n_samples, 1)
-            # r_mu.shape = (batch_size, n_samples, action_dim)
+        r_mu = mu.unsqueeze(1).repeat(1, n_samples, 1)
+        r_log_variance = log_variance.unsqueeze(1).repeat(1, n_samples, 1)
+        # r_mu.shape = (batch_size, n_samples, action_dim)
 
-            actions = self._infer_action_using_reparameterization(r_mu, r_log_variance)
-            # actions.shape = (batch_size, n_samples, action_dim)
+        actions = self._infer_action_using_reparameterization(r_mu, r_log_variance)
+        # actions.shape = (batch_size, n_samples, action_dim)
 
-            return mu, log_variance, actions, torch.exp(
-                (self._log_prob(actions, r_mu, self._variance2std(r_log_variance))))
+        return mu, log_variance, actions, torch.exp((self._log_prob(actions, r_mu, self._variance2std(r_log_variance))))
 
     def _infer_action_using_reparameterization(self, mu, log_variance):
         # Apply reparameterization trick
