@@ -3,12 +3,12 @@ freeze_period: 25
 gamma: 1.00
 beta: 0.99
 print_timer: 100
-n_sampled_actions: 100
+n_sampled_actions: 128
 noise_eps: 0.2
 random_eps: 0.3
 
 # HER
 replay_strategy: future
-replay_k: 3
+replay_k: 4
 
 polyak: 0.95

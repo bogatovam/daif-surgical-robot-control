@@ -57,35 +57,7 @@ import gym
 import threading
 import numpy as np
 
-
-def plot_grad_flow(named_parameters):
-    '''Plots the gradients flowing through different layers in the net during training.
-    Can be used for checking for possible gradient vanishing / exploding problems.
-
-    Usage: Plug this function in Trainer class after loss.backwards() as
-    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
-    ave_grads = []
-    max_grads = []
-    layers = []
-    for n, p in named_parameters:
-        if (p.requires_grad) and ("bias" not in n):
-            layers.append(n)
-            ave_grads.append(p.grad.abs().mean())
-            max_grads.append(p.grad.abs().max())
-    plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
-    plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")
-    plt.hlines(0, 0, len(ave_grads) + 1, lw=2, color="k")
-    plt.xticks(range(0, len(ave_grads), 1), layers, rotation="vertical")
-    plt.xlim(left=0, right=len(ave_grads))
-    plt.ylim(bottom=-0.001, top=0.02)  # zoom in on the lower gradient regions
-    plt.xlabel("Layers")
-    plt.ylabel("average gradient")
-    plt.title("Gradient flow")
-    plt.grid(True)
-    plt.legend([Line2D([0], [0], color="c", lw=4),
-                Line2D([0], [0], color="b", lw=4),
-                Line2D([0], [0], color="k", lw=4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])
-    plt.show()
+torch.autograd.set_detect_anomaly(True)
 
 
 class ReplayBuffer:
@@ -247,73 +219,38 @@ class Normalizer:
         self.size = size
         self.eps = eps
         self.default_clip_range = default_clip_range
+
         # some local information
         self.local_sum = np.zeros(self.size, np.float32)
         self.local_sumsq = np.zeros(self.size, np.float32)
         self.local_count = np.zeros(1, np.float32)
-        # get the total sum sumsq and sum count
-        self.total_sum = np.zeros(self.size, np.float32)
-        self.total_sumsq = np.zeros(self.size, np.float32)
-        self.total_count = np.ones(1, np.float32)
+
         # get the mean and std
         self.mean = np.zeros(self.size, np.float32)
         self.std = np.ones(self.size, np.float32)
-        # thread locker
-        self.lock = threading.Lock()
 
     # update the parameters of the normalizer
     def update(self, v):
         v = v.reshape(-1, self.size)
         # do the computing
-        with self.lock:
-            self.local_sum += v.sum(axis=0)
-            self.local_sumsq += (np.square(v)).sum(axis=0)
-            self.local_count[0] += v.shape[0]
-
-    # sync the parameters across the cpus
-    def sync(self, local_sum, local_sumsq, local_count):
-        local_sum[...] = self._mpi_average(local_sum)
-        local_sumsq[...] = self._mpi_average(local_sumsq)
-        local_count[...] = self._mpi_average(local_count)
-        return local_sum, local_sumsq, local_count
+        self.local_sum += v.sum(axis=0)
+        self.local_sumsq += (np.square(v)).sum(axis=0)
+        self.local_count[0] += v.shape[0]
 
     def recompute_stats(self):
-        with self.lock:
-            local_count = self.local_count.copy()
-            local_sum = self.local_sum.copy()
-            local_sumsq = self.local_sumsq.copy()
-            # reset
-            self.local_count[...] = 0
-            self.local_sum[...] = 0
-            self.local_sumsq[...] = 0
-        # synrc the stats
-        sync_sum, sync_sumsq, sync_count = self.sync(local_sum, local_sumsq, local_count)
-        # update the total stuff
-        self.total_sum += sync_sum
-        self.total_sumsq += sync_sumsq
-        self.total_count += sync_count
         # calculate the new mean and std
-        self.mean = self.total_sum / self.total_count
-        self.std = np.sqrt(np.maximum(np.square(self.eps), (self.total_sumsq / self.total_count) - np.square(
-            self.total_sum / self.total_count)))
-
-    # average across the cpu's data
-    def _mpi_average(self, x):
-        buf = np.zeros_like(x)
-        # buf /= MPI.COMM_WORLD.Get_size()
-        buf /= 1
-        return buf
+        self.mean = self.local_sum / self.local_count
+        self.std = np.sqrt(np.maximum(np.square(self.eps), (self.local_sumsq / self.local_count) - np.square(
+            self.local_sum / self.local_count)))
 
     # normalize the observation
-    def normalize(self, v, clip_range=None):
-        if clip_range is None:
-            clip_range = self.default_clip_range
-        return np.clip((v - self.mean) / self.std, -clip_range, clip_range)
+    def normalize(self, v):
+        return (v - self.mean) / self.std
 
 
 class MLP(BaseModel):
     def __init__(self, input_size, layer_sizes, output_size, lr=0.001, output_activation=torch.nn.Identity,
-                 activation=torch.nn.ELU, device='cpu'):
+                 activation=torch.nn.SiLU, weight_decay=1e-4, device='cpu'):
         super(MLP, self).__init__()
         sizes = [input_size] + layer_sizes + [output_size]
 
@@ -323,7 +260,34 @@ class MLP(BaseModel):
             self.layers += [nn.Linear(sizes[i], sizes[i + 1]), act()]
 
         self.layers = nn.ModuleList(self.layers)
-        self.optimizer = optim.Adam(self.parameters(), lr)  # Adam optimizer
+        self.optimizer = optim.Adam(self.parameters(), lr, weight_decay=weight_decay)  # Adam optimizer
+
+        self.device = device
+        self.to(self.device)
+
+    def forward(self, inp):
+        x = inp
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class MuLogVarMLP(BaseModel):
+    def __init__(self, input_size, layer_sizes, output_size, lr=0.001, output_activation=torch.nn.Identity,
+                 activation=torch.nn.SiLU, weight_decay=1e-4, device='cpu'):
+        super(MuLogVarMLP, self).__init__()
+        sizes = [input_size] + layer_sizes + [output_size]
+
+        self.layers = []
+        for i in range(len(sizes) - 1):
+            act = activation if i < len(sizes) - 2 else output_activation
+            self.layers += [nn.Linear(sizes[i], sizes[i + 1]), act()]
+
+        self.layers = nn.ModuleList(self.layers)
+        self.optimizer = optim.Adam(self.parameters(), lr, weight_decay=weight_decay)  # Adam optimizer
+
+        self.max_log_var = -1
+        self.min_log_var = -5
 
         self.device = device
         self.to(self.device)
@@ -339,6 +303,7 @@ class Agent:
     def __init__(self, env, config):
         self.env = env
         self.experiment_name = config.experiment_name
+        self.experiment_description = config.experiment_description
         self.observation_dim, self.goal_dim, self.action_dim, self.action_max = get_env_parameters(env)
 
         self.device = config.device_id
@@ -381,17 +346,21 @@ class Agent:
         self.n_sampled_actions = config.n_sampled_actions
         self.freeze_cntr = 0
 
-        self.transition_net = MLP(self.state_size + self.action_dim, [64, 64], self.state_size, lr=0.001,
+        self.transition_net = MLP(self.state_size + self.action_dim, [256, 256], self.state_size, lr=0.001,
                                   device=self.device)
 
-        self.prediction_policy_mu_network = MLP(self.state_size, [64] * 2, self.action_dim, device=self.device)
-        self.prediction_policy_logstd_network = MLP(self.state_size, [64] * 2, self.action_dim, device=self.device)
+        self.prediction_policy_mu_network = MLP(self.state_size, [256] * 2, self.action_dim,
+                                                output_activation=torch.nn.Tanh,
+                                                device=self.device)
+        self.prediction_policy_logstd_network = MLP(self.state_size, [256] * 2, self.action_dim,
+                                                    # output_activation=torch.nn.ReLU,
+                                                    device=self.device)
 
         self.value_net = MLP(self.state_size + self.action_dim,
-                             [64] + [32],
+                             [128] + [128],
                              1, device=self.device)
         self.target_net = MLP(self.state_size + self.action_dim,
-                              [64] + [32],
+                              [128] + [128],
                               1, device=self.device)
 
         self.her_module = HERSampler(config.replay_strategy, config.replay_k, self.env.compute_reward,
@@ -402,11 +371,15 @@ class Agent:
 
         self.o_norm = Normalizer(size=env.observation_space.spaces['observation'].shape[0])
         self.g_norm = Normalizer(size=env.observation_space.spaces['desired_goal'].shape[0])
+        self.a_norm = Normalizer(size=self.action_dim)
 
         self.writer = TensorboardWriter(prepare_path(config.tb_log_folder, experiment_name=config.experiment_name),
                                         True)
 
-        self.metrics = MetricTracker('vfe', 'efe_mse_loss', 'success_rate', 'reward', writer=self.writer)
+        self.metrics = MetricTracker('vfe', 'efe_mse_loss', 'success_rate', 'reward', 'elapsed_steps_count',
+                                     'transition_net_grad', 'prediction_policy_mu_network_grad',
+                                     'prediction_policy_logstd_network_grad', 'value_net_grad',
+                                     writer=self.writer)
 
     def get_mini_batches(self):
         # Retrieve transition data in mini batches
@@ -438,7 +411,8 @@ class Agent:
 
     def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
                                action_batch_t1, reward_batch_t1,
-                               done_batch_t2, pred_error_batch_t0t1):
+                               done_batch_t2, pred_error_batch_t0t1,
+                               log_var, sampled_actions_batch_t1, probs_t1):
 
         with torch.no_grad():
             # Determine the action distribution for time t2:
@@ -458,14 +432,11 @@ class Agent:
             target_expected_free_energies_batch_t2 = target_expected_free_energies_batch_t2.reshape(source_shape[0],
                                                                                                     source_shape[1])
             # Weigh the target EFEs according to the action distribution:
-            weighted_targets = (probs_t2.sum(-1) * target_expected_free_energies_batch_t2).sum(-1).unsqueeze(1)
+            weighted_targets = (probs_t2.mean(-1) * target_expected_free_energies_batch_t2).sum(-1).unsqueeze(1)
 
             # Determine the batch of bootstrapped estimates of the EFEs:
             expected_free_energy_estimate_batch = (
                     -reward_batch_t1 + pred_error_batch_t0t1 + self.beta * weighted_targets)
-
-        _, _, sampled_actions_batch_t1, probs_t1 = self._sample_actions_with_probs(state_batch_t1,
-                                                                                   self.n_sampled_actions)
 
         # Determine the Expected free energy at time t1 according to the value network:
         repeated_obs_batch = state_batch_t1.unsqueeze(1).repeat(1, self.n_sampled_actions, 1)
@@ -474,20 +445,17 @@ class Agent:
         value_net_input = torch.reshape(value_net_input,
                                         shape=(source_shape[0] * source_shape[1], source_shape[2]))
 
-        value_net_output = self.value_net(value_net_input)
+        value_net_output = self.value_net(value_net_input.detach())
         value_net_output = value_net_output.reshape(source_shape[0], source_shape[1])
 
-        efe_batch_t1 = (probs_t1.sum(-1) * value_net_output).sum(-1).unsqueeze(1)
+        efe_batch_t1 = (probs_t1.detach().mean(-1) * value_net_output).sum(-1).unsqueeze(1)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
         value_net_loss = F.mse_loss(expected_free_energy_estimate_batch, efe_batch_t1)
         return value_net_loss
 
-    def compute_variational_free_energy(self, state_batch_t1, action_batch_t1, pred_error_batch_t0t1):
-        # Determine the action distribution for time t1:
-        _, log_var, sampled_actions_batch_t1, probs_t1 = self._sample_actions_with_probs(state_batch_t1,
-                                                                                         self.n_sampled_actions)
-
+    def compute_variational_free_energy(self, state_batch_t1, action_batch_t1, pred_error_batch_t0t1,
+                                        log_var, sampled_actions_batch_t1, probs_t1):
         # Determine the Expected free energy at time t1 according to the value network:
         repeated_obs_batch = state_batch_t1.unsqueeze(1).repeat(1, self.n_sampled_actions, 1)
         value_net_input = torch.cat([repeated_obs_batch, sampled_actions_batch_t1], dim=2)
@@ -504,15 +472,15 @@ class Agent:
             min=1e-9, max=1 - 1e-9)
 
         # Weigh them according to the action distribution:
-        energy_batch = -(probs_t1.sum(-1) * torch.log(boltzmann_expected_free_energy_batch_t1)).sum(1).view(
+        energy_batch = -(probs_t1.mean(-1) * torch.log(boltzmann_expected_free_energy_batch_t1)).sum(-1).view(
             self.batch_size, 1)
 
         # Determine the entropy of the action distribution
-        entropy_batch = -(0.5 + 0.5 * math.log(2 * math.pi) + torch.log(self._variance2std(log_var))) \
-            .sum(-1).view(self.batch_size, 1)
+        entropy_batch = (0.5 + 0.5 * math.log(2 * math.pi) + torch.log(self._variance2std(log_var))).sum(-1).view(
+            self.batch_size, 1)
 
         # Determine the Variable Free Energy, then take the mean over all batch samples:
-        vfe_batch = pred_error_batch_t0t1 + (energy_batch - entropy_batch)
+        vfe_batch = pred_error_batch_t0t1 + (energy_batch + entropy_batch)
         vfe = torch.mean(vfe_batch)
 
         return vfe
@@ -523,11 +491,19 @@ class Agent:
          action_batch_t1, reward_batch_t1, done_batch_t2,
          pred_error_batch_t0t1) = self.get_mini_batches()
         # Compute the value network loss:
+
+        _, log_var, sampled_actions_batch_t1, probs_t1 = self._sample_actions_with_probs(state_batch_t1,
+                                                                                         self.n_sampled_actions)
+
         value_net_loss = self.compute_value_net_loss(state_batch_t1, state_batch_t2,
                                                      action_batch_t1, reward_batch_t1,
-                                                     done_batch_t2, pred_error_batch_t0t1)
+                                                     done_batch_t2, pred_error_batch_t0t1,
+                                                     log_var, sampled_actions_batch_t1, probs_t1)
+
         # Compute the variational free energy:
-        vfe = self.compute_variational_free_energy(state_batch_t1, action_batch_t1, pred_error_batch_t0t1)
+        vfe = self.compute_variational_free_energy(state_batch_t1, action_batch_t1, pred_error_batch_t0t1,
+                                                   log_var, sampled_actions_batch_t1, probs_t1)
+
         # Reset the gradients:
         self.transition_net.optimizer.zero_grad()
         self.prediction_policy_mu_network.optimizer.zero_grad()
@@ -544,12 +520,20 @@ class Agent:
         # clip_return = 1 / (1 - self.args.gamma)
         # target_q_value = torch.clamp(target_q_value, -clip_return, 0)
         # Perform gradient descent:
+        # grad_norm_world = torch.nn.utils.clip_grad_norm_(utils.get_parameters([self.wm]), self.grad_clip)
+        transition_net_grad = torch.nn.utils.clip_grad_norm_(self.transition_net.parameters(), 100.)
+        prediction_policy_mu_network_grad = torch.nn.utils.clip_grad_norm_(
+            self.prediction_policy_mu_network.parameters(), 100.)
+        prediction_policy_logstd_network_grad = torch.nn.utils.clip_grad_norm_(
+            self.prediction_policy_logstd_network.parameters(), 100.)
+        value_net_grad = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 100.)
+
         self.transition_net.optimizer.step()
         self.prediction_policy_mu_network.optimizer.step()
         self.prediction_policy_logstd_network.optimizer.step()
         self.value_net.optimizer.step()
 
-        return vfe.item(), value_net_loss.item()
+        return vfe.item(), value_net_loss.item(), transition_net_grad.item(), prediction_policy_mu_network_grad.item(), prediction_policy_logstd_network_grad.item(), value_net_grad.item()
 
     # soft update
     def _soft_update_target_network(self, target, source):
@@ -561,35 +545,39 @@ class Agent:
         images = []
         total_reward = []
         total_success_rate = []
+        elapsed_steps_count = []
 
-        for cycle in range(1):
+        for cycle in range(epoch):
             per_reward = []
-            per_success_rate = []
-
             observation, _, desired_goal, _, reward = self._reset()
 
-            for _ in range(self._max_episode_steps):
+            done = False
+            episode_step = 0
+            while not done and episode_step < self._max_episode_steps:
                 input_tensor = self._preprocess_inputs(observation, desired_goal)
                 action = self._select_action(input_tensor)
 
                 # feed the actions into the environment
-                new_observation, reward, _, info = self.env.step(action)
+                new_observation, reward, done, info = self.env.step(action)
 
                 observation = new_observation['observation']
                 per_reward.append(reward)
-                per_success_rate.append(info['is_success'])
+                episode_step += 1
 
                 # if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
                 #     images += [self.env.render()]
 
             total_reward.append(np.mean(per_reward))
-            total_success_rate.append(np.mean(per_success_rate))
+            total_success_rate.append(1 if done and episode_step < self._max_episode_steps else 0)
+            elapsed_steps_count.append(episode_step)
 
         total_reward = np.asarray(total_reward)
         total_success_rate = np.asarray(total_success_rate)
-        return np.mean(total_success_rate), np.mean(total_reward), np.asarray(images)
+        elapsed_steps_count = np.asarray(elapsed_steps_count)
+        return np.mean(total_success_rate), np.mean(total_reward), np.asarray(images), np.mean(elapsed_steps_count)
 
     def train(self):
+        self.writer.add_text(self.experiment_name, self.experiment_description)
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
         for epoch in range(self.n_epochs):
@@ -597,12 +585,14 @@ class Agent:
                 self.writer.set_step(self.n_cycles * epoch + step)
 
                 cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
-                for _ in range(self.n_batches):
+                cycle_summary_data = {'done': [], 'reward': []}
+
+                for _ in range(self.n_episodes):
                     observation, achieved_goal, desired_goal, done, reward = self._reset()
 
                     episode_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
-
-                    for _ in range(self._max_episode_steps):
+                    episode_summary_data = {'done_step': self._max_episode_steps, 'reward': []}
+                    for episode_step in range(self._max_episode_steps):
                         input_tensor = self._preprocess_inputs(observation, desired_goal)
                         action = self._select_action(input_tensor)
 
@@ -612,7 +602,11 @@ class Agent:
                         episode_data['action'].append(action.copy())
 
                         # feed the actions into the environment
-                        new_observation, _, _, _ = self.env.step(action)
+                        new_observation, reward, done, _ = self.env.step(action)
+
+                        if done:
+                            episode_summary_data['done_step'] = episode_step
+                        episode_summary_data['reward'].append(np.mean(reward))
 
                         observation = new_observation['observation']
                         achieved_goal = new_observation['achieved_goal']
@@ -622,27 +616,50 @@ class Agent:
                     cycle_data['desired_goal'].append(np.asarray(episode_data['desired_goal'], dtype=np.float32))
                     cycle_data['action'].append(np.asarray(episode_data['action'], dtype=np.float32))
 
+                    cycle_summary_data['done'].append(episode_summary_data['done_step'] < self._max_episode_steps)
+                    cycle_summary_data['reward'].append(np.mean(episode_summary_data['reward']))
+
                 cycle_data['observation'] = np.asarray(cycle_data['observation'], dtype=np.float32)
                 cycle_data['achieved_goal'] = np.asarray(cycle_data['achieved_goal'], dtype=np.float32)
                 cycle_data['desired_goal'] = np.asarray(cycle_data['desired_goal'], dtype=np.float32)
                 cycle_data['action'] = np.asarray(cycle_data['action'], dtype=np.float32)
 
+                cycle_summary_data['done'] = np.asarray(cycle_summary_data['done'], dtype=np.float32)
+                cycle_summary_data['reward'] = np.asarray(cycle_summary_data['reward'], dtype=np.float32)
+
                 # store the episodes
-                self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_batches)
+                self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_episodes)
                 self._update_normalizer(**cycle_data)
 
                 vfe = []
                 value_net_loss = []
+                (transition_net_grad_acc, prediction_policy_mu_network_grad_acc,
+                 prediction_policy_logstd_network_grad_acc, value_net_grad_acc) = 0, 0, 0, 0
                 for _ in range(self.n_batches):
                     # train the network
-                    vfe_item, value_net_loss_item = self._update_network()
+                    (vfe_item, value_net_loss_item, transition_net_grad, prediction_policy_mu_network_grad,
+                     prediction_policy_logstd_network_grad, value_net_grad) = self._update_network()
                     vfe.append(vfe_item), value_net_loss.append(value_net_loss_item)
+
+                    transition_net_grad_acc += transition_net_grad
+                    prediction_policy_mu_network_grad_acc += prediction_policy_mu_network_grad
+                    prediction_policy_logstd_network_grad_acc += prediction_policy_logstd_network_grad
+                    value_net_grad_acc += value_net_grad
 
                 self.metrics.update('vfe', np.mean(vfe))
                 self.metrics.update('efe_mse_loss', np.mean(value_net_loss))
+                self.metrics.update('transition_net_grad', transition_net_grad_acc / self.n_batches)
+                self.metrics.update('prediction_policy_mu_network_grad',
+                                    prediction_policy_mu_network_grad_acc / self.n_batches)
+                self.metrics.update('prediction_policy_logstd_network_grad',
+                                    prediction_policy_logstd_network_grad_acc / self.n_batches)
+                self.metrics.update('value_net_grad', value_net_grad_acc / self.n_batches)
                 # soft update
                 self._soft_update_target_network(self.target_net, self.value_net)
-                val_success_rate, val_reward, images = self._eval_agent(epoch)
+                # val_success_rate, val_reward, images, elapsed_steps_count = self._eval_agent(10)
+                val_success_rate = np.mean(cycle_summary_data['done'])
+                val_reward = np.mean(cycle_summary_data['reward'])
+
                 self.metrics.update('success_rate', val_success_rate)
                 self.metrics.update('reward', val_reward)
                 self.log_models_parameters()
@@ -723,10 +740,11 @@ class Agent:
         r_log_variance = log_variance.unsqueeze(1).repeat(1, n_samples, 1)
         # r_mu.shape = (batch_size, n_samples, action_dim)
 
-        actions = self._infer_action_using_reparameterization(r_mu, r_log_variance)
+        actions = self._infer_action_using_reparameterization(r_mu, r_log_variance).detach()
         # actions.shape = (batch_size, n_samples, action_dim)
-
-        return mu, log_variance, actions, torch.exp((self._log_prob(actions, r_mu, self._variance2std(r_log_variance))))
+        probs = torch.exp((self._log_prob(actions, r_mu, self._variance2std(r_log_variance))))
+        # actions = self.a_norm.normalize(actions)
+        return mu, log_variance, actions, probs
 
     def _infer_action_using_reparameterization(self, mu, log_variance):
         # Apply reparameterization trick
@@ -743,34 +761,31 @@ class Agent:
         # compute the variance
         var = torch.pow(scale, 2)
         log_scale = torch.log(scale)
-        return -((value - loc) ** 2) / (2 * var) - log_scale - math.log(math.sqrt(2 * math.pi))
+        return -((value.detach() - loc) ** 2) / (2 * var) - log_scale - math.log(math.sqrt(2 * math.pi))
 
     def prediction(self, input_tensor):
         mu = self.prediction_policy_mu_network(input_tensor)
         log_std = self.prediction_policy_logstd_network(input_tensor)
-        # log_std = torch.clamp(log_std, *(-20, 2))
+        log_std = torch.sigmoid(log_std)
+        log_std = (
+                -7 + (-0.1 - -7) * log_std
+        )
+        # log_std = torch.clamp(log_std, *(-20, 1))
         return mu, log_std
 
     def _preprocess_inputs(self, observation, goal):
-        observation, goal = self._preprocess_observation_and_goal(observation, goal)
-        # obs_norm = self.o_norm.normalize(observation)
-        # goal_norm = self.g_norm.normalize(goal)
+        observation = self.o_norm.normalize(observation)
+        goal = self.g_norm.normalize(goal)
         # concatenate the stuffs
         inputs = np.concatenate([observation, goal])
         return torch.tensor(inputs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
     def _preprocess_batch_inputs(self, observation_batch, goal_batch):
-        observation_batch, goal_batch = self._preprocess_observation_and_goal(observation_batch, goal_batch)
-        # obs_norm = self.o_norm.normalize(observation_batch)
-        # goal_norm = self.g_norm.normalize(goal_batch)
+        observation_batch = self.o_norm.normalize(observation_batch)
+        goal_batch = self.g_norm.normalize(goal_batch)
         # concatenate the stuffs
         inputs = np.concatenate([observation_batch, goal_batch], axis=1)
         return torch.tensor(inputs, dtype=torch.float32, device=self.device)
-
-    def _preprocess_observation_and_goal(self, o, g):
-        o = np.clip(o, -200, 200)
-        g = np.clip(g, -200, 200)
-        return o, g
 
     def _update_normalizer(self, observation, achieved_goal, desired_goal, action):
         # get the number of normalization transitions
@@ -780,16 +795,16 @@ class Agent:
                                                                                       desired_goal, action,
                                                                                       num_transitions)
 
-        (observation_batch_t0, _, desired_goal_batch_t0, _) = t0
+        (observation_batch, _, desired_goal_batch, actions) = t0
 
-        observation_batch, desired_goal_batch = self._preprocess_observation_and_goal(observation_batch_t0,
-                                                                                      desired_goal_batch_t0)
         # update
         self.o_norm.update(observation_batch)
         self.g_norm.update(desired_goal_batch)
+        self.a_norm.update(actions)
         # recompute the stats
         self.o_norm.recompute_stats()
         self.g_norm.recompute_stats()
+        self.a_norm.recompute_stats()
 
     def as_tensor(self, numpy_array):
         return torch.tensor(numpy_array, dtype=torch.float32, device=self.device)
