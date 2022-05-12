@@ -435,7 +435,7 @@ class Actor(BasePolicy):
             input_size,
             net_arch,
             weight_decay=0.00001,
-            lr=0.0005,
+            lr=0.001,
             activation_fn=nn.ReLU,
             use_sde: bool = False,
             log_std_init: float = -3,
@@ -457,7 +457,7 @@ class Actor(BasePolicy):
         self.full_std = full_std
         self.clip_mean = clip_mean
 
-        self.LOG_STD_MAX = 1
+        self.LOG_STD_MAX = 2
         self.LOG_STD_MIN = -20
 
         action_dim = get_action_dim(self.action_space)
@@ -523,8 +523,8 @@ class Actor(BasePolicy):
 
 
 class MLP(BaseModel):
-    def __init__(self, input_size, layer_sizes, output_size, lr=0.0005, output_activation=torch.nn.Identity,
-                 activation=torch.nn.SiLU, weight_decay=1e-6, device='cpu'):
+    def __init__(self, input_size, layer_sizes, output_size, lr=0.001, output_activation=torch.nn.Identity,
+                 activation=torch.nn.SiLU, weight_decay=1e-4, device='cpu'):
         super(MLP, self).__init__()
         sizes = [input_size] + layer_sizes + [output_size]
 
@@ -544,6 +544,113 @@ class MLP(BaseModel):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+class VAE(nn.Module):
+    # In part taken from:
+    #   https://github.com/pytorch/examples/blob/master/vae/main.py
+
+    def __init__(self, n_screens, n_latent_states, lr=1e-5, device='cpu'):
+        super(VAE, self).__init__()
+
+        self.device = device
+
+        self.n_screens = n_screens
+        self.n_latent_states = n_latent_states
+
+        # The convolutional encoder
+        self.encoder = nn.Sequential(
+            nn.Conv3d(3, 16, (5, 5, 1), (2, 2, 1)),
+            nn.BatchNorm3d(16),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(16, 32, (5, 5, 1), (2, 2, 1)),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(32, 32, (5, 5, 1), (2, 2, 1)),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True)
+        ).to(self.device)
+
+        # The size of the encoder output
+        self.conv3d_shape_out = (32, 2, 8, self.n_screens)
+        self.conv3d_size_out = np.prod(self.conv3d_shape_out)
+
+        # The convolutional decoder
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose3d(32, 32, (5, 5, 1), (2, 2, 1)),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+
+            nn.ConvTranspose3d(32, 16, (5, 5, 1), (2, 2, 1)),
+            nn.BatchNorm3d(16),
+            nn.ReLU(inplace=True),
+
+            nn.ConvTranspose3d(16, 3, (5, 5, 1), (2, 2, 1)),
+            nn.BatchNorm3d(3),
+            nn.ReLU(inplace=True),
+
+            nn.Sigmoid()
+        ).to(self.device)
+
+        # Fully connected layers connected to encoder
+        self.fc1 = nn.Linear(self.conv3d_size_out, self.conv3d_size_out // 2)
+        self.fc2_mu = nn.Linear(self.conv3d_size_out // 2, self.n_latent_states)
+        self.fc2_logvar = nn.Linear(self.conv3d_size_out // 2, self.n_latent_states)
+
+        # Fully connected layers connected to decoder
+        self.fc3 = nn.Linear(self.n_latent_states, self.conv3d_size_out // 2)
+        self.fc4 = nn.Linear(self.conv3d_size_out // 2, self.conv3d_size_out)
+
+        self.optimizer = optim.Adam(self.parameters(), lr)
+
+        self.to(self.device)
+
+    def encode(self, x):
+        # Deconstruct input x into a distribution over latent states
+        conv = self.encoder(x)
+        h1 = F.relu(self.fc1(conv.view(conv.size(0), -1)))
+        mu, logvar = self.fc2_mu(h1), self.fc2_logvar(h1)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        # Apply reparameterization trick
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z, batch_size=1):
+        # Reconstruct original input x from the (reparameterized) latent states
+        h3 = F.relu(self.fc3(z))
+        deconv_input = self.fc4(h3)
+        deconv_input = deconv_input.view([batch_size] + [dim for dim in self.conv3d_shape_out])
+        y = self.decoder(deconv_input)
+        return y
+
+    def forward(self, x, batch_size=1):
+        # Deconstruct and then reconstruct input x
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z, batch_size)
+        return recon, mu, logvar
+
+    # Reconstruction + KL divergence losses summed over all elements and batch
+    def loss_function(self, recon_x, x, mu, logvar, batch=True):
+        if batch:
+            BCE = F.binary_cross_entropy(recon_x, x, reduction='none')
+            BCE = torch.sum(BCE, dim=(1, 2, 3, 4))
+
+            KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        else:
+            BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
+            # see Appendix B from VAE paper:
+            # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
+            # https://arxiv.org/abs/1312.6114
+            # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+            KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+        return BCE + KLD
 
 
 class Agent:
@@ -594,19 +701,25 @@ class Agent:
         self.n_sampled_actions = config.n_sampled_actions
         self.freeze_cntr = 0
 
+        self.n_screens = 4
+        self.n_latent_states = 32
+        self.lr_vae = 1e-5
+
+        self.vae = VAE(self.n_screens, self.n_latent_states, lr=self.lr_vae, device=self.device)
+
         self.actor = Actor(env.observation_space, env.action_space,
                            self.state_size,
-                           [256, 256, 256])
+                           [128, 256, 128])
 
         self.transition_net = MLP(self.state_size + self.action_dim,
-                                  [64, 128, 64], self.state_size, lr=0.0005,
+                                  [128, 256, 128], self.state_size, lr=0.001,
                                   device=self.device)
 
         self.value_net = MLP(self.state_size + self.action_dim,
-                             [256, 256, 256],
+                             [128, 256, 128],
                              1, device=self.device)
         self.target_net = MLP(self.state_size + self.action_dim,
-                              [256, 256, 256],
+                              [128, 256, 128],
                               1, device=self.device)
 
         self.her_module = HERSampler(config.replay_strategy, config.replay_k, self.env.compute_reward,
@@ -618,7 +731,7 @@ class Agent:
         self.o_norm = Normalizer(size=env.observation_space.spaces['observation'].shape[0])
         self.g_norm = Normalizer(size=env.observation_space.spaces['desired_goal'].shape[0])
         self.a_norm = Normalizer(size=self.action_dim)
-        self.target_update_interval = 1
+        self.target_update_interval = 2
 
         self.writer = TensorboardWriter(prepare_path(config.tb_log_folder, experiment_name=config.experiment_name),
                                         True)
@@ -685,7 +798,7 @@ class Agent:
         value_net_output = self.value_net(value_net_input)
         action_probs_t1 = torch.exp(log_prob_batch_t1).clamp(0, 1)
 
-        efe_batch_t1 = value_net_output
+        efe_batch_t1 = (value_net_output)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
         value_net_loss = F.mse_loss(expected_free_energy_estimate_batch, efe_batch_t1)
@@ -726,12 +839,18 @@ class Agent:
                                                      actions_batch_t1, actions_batch_t2,
                                                      log_prob_batch_t1, log_prob_batch_t2,
                                                      reward_batch, done_batch, pred_error_batch_t0t1)
+
+        # Determine the reconstruction loss for time t1
+        recon_batch = self.vae.decode(z_batch_t1, self.batch_size)
+        vae_loss = self.vae.loss_function(recon_batch, obs_batch_t1, state_mu_batch_t1, state_logvar_batch_t1,
+                                          batch=True) / self.alpha
+
         self.transition_net.optimizer.zero_grad()
 
         self.value_net.optimizer.zero_grad()
         value_net_loss.backward()
 
-        value_net_grad = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 100000.)
+        value_net_grad = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 100.)
 
         self.value_net.optimizer.step()
 
@@ -742,8 +861,8 @@ class Agent:
         self.actor.optimizer.zero_grad()
         vfe.backward()
 
-        actor_grad = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100000.)
-        transition_net_grad = torch.nn.utils.clip_grad_norm_(self.transition_net.parameters(), 100000.)
+        actor_grad = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100.)
+        transition_net_grad = torch.nn.utils.clip_grad_norm_(self.transition_net.parameters(), 100.)
 
         self.actor.optimizer.step()
         self.transition_net.optimizer.step()
@@ -823,6 +942,7 @@ class Agent:
 
                         # feed the actions into the environment
                         new_observation, reward, done, _ = self.env.step(action)
+                        obs = self.get_screen(self.env, self.device)
 
                         if done:
                             episode_summary_data['done_step'] = episode_step
@@ -970,15 +1090,15 @@ class Agent:
         return -((value.detach() - loc) ** 2) / (2 * var) - log_scale - math.log(math.sqrt(2 * math.pi))
 
     def _preprocess_inputs(self, observation, goal):
-        observation = self.o_norm.normalize(observation)
-        goal = self.g_norm.normalize(goal)
+        # observation = self.o_norm.normalize(observation)
+        # goal = self.g_norm.normalize(goal)
         # concatenate the stuffs
         inputs = np.concatenate([observation, goal])
         return torch.tensor(inputs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
     def _preprocess_batch_inputs(self, observation_batch, goal_batch):
-        observation_batch = self.o_norm.normalize(observation_batch)
-        goal_batch = self.g_norm.normalize(goal_batch)
+        # observation_batch = self.o_norm.normalize(observation_batch)
+        # goal_batch = self.g_norm.normalize(goal_batch)
         # concatenate the stuffs
         inputs = np.concatenate([observation_batch, goal_batch], axis=1)
         return torch.tensor(inputs, dtype=torch.float32, device=self.device)

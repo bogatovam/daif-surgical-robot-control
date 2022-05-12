@@ -1,5 +1,5 @@
-experiment_name: actor-from-stable-baseline
-experiment_description: "-7 + (-0.1 - -7) * log_std"
+experiment_name: actor-from-stable-baseline-v15
+experiment_description: "[256, 256, 256]  256 batchsize"
 
 monitor_file: logs\{experiment_name}\monitor.csv
 tb_log_folder: logs\{experiment_name}\tensorboard
@@ -7,8 +7,8 @@ seed: 42
 
 n_epochs: 50
 n_cycles: 50
-n_batches: 20
-max_episode_steps: 500
+n_batches: 10
+max_episode_steps: 100
 n_episodes: 10
 
 should_save_model: true
