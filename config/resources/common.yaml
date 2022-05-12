@@ -1,4 +1,4 @@
-experiment_name: please-work-v11
+experiment_name: actor-from-stable-baseline
 experiment_description: "-7 + (-0.1 - -7) * log_std"
 
 monitor_file: logs\{experiment_name}\monitor.csv
