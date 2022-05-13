@@ -413,7 +413,6 @@ class SquashedDiagGaussianDistribution(DiagGaussianDistribution):
 
 
 class Actor(BasePolicy):
-    # todo distribution
     def __init__(
             self,
             observation_space: gym.spaces.Space,
@@ -443,7 +442,7 @@ class Actor(BasePolicy):
         self.full_std = full_std
         self.clip_mean = clip_mean
 
-        self.LOG_STD_MAX = 1
+        self.LOG_STD_MAX = 2
         self.LOG_STD_MIN = -20
 
         action_dim = get_action_dim(self.action_space)
@@ -452,22 +451,21 @@ class Actor(BasePolicy):
 
         last_layer_dim = net_arch[-1]
 
-        self.action_dist = DiagGaussianDistribution(action_dim)
-        self.mu = nn.Linear(last_layer_dim, action_dim)
-        self.mu = nn.Sequential(self.mu, nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean))
-
-        self.log_std = nn.Linear(last_layer_dim, action_dim)
-        torch.nn.init.xavier_normal_(self.log_std.weight)
-
-        def init_weights(m):
-            if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_normal_(m.weight)
-                m.bias.data.fill_(0.01)
-
-        self.latent_pi.apply(init_weights)
-        self.mu.apply(init_weights)
-
-        self.optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+        if self.use_sde:
+            self.action_dist = StateDependentNoiseDistribution(
+                action_dim, full_std=full_std, use_expln=use_expln, learn_features=True, squash_output=True
+            )
+            self.mu, self.log_std = self.action_dist.proba_distribution_net(
+                latent_dim=last_layer_dim, latent_sde_dim=last_layer_dim, log_std_init=log_std_init
+            )
+            # Avoid numerical issues by limiting the mean of the Gaussian
+            # to be in [-clip_mean, clip_mean]
+            if clip_mean > 0.0:
+                self.mu = nn.Sequential(self.mu, nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean))
+        else:
+            self.action_dist = SquashedDiagGaussianDistribution(action_dim)
+            self.mu = nn.Linear(last_layer_dim, action_dim)
+            self.log_std = nn.Linear(last_layer_dim, action_dim)
 
     def _get_constructor_parameters(self):
         data = super()._get_constructor_parameters()
@@ -559,6 +557,8 @@ class Agent:
 
         self.polyak = int(config.hparams.polyak)
 
+        self.use_sde = int(config.hparams.use_sde)
+
         self.n_epochs = int(config.hparams.n_epochs)
         self.n_cycles = int(config.hparams.n_cycles)
         self.n_episodes = int(config.hparams.n_episodes)
@@ -590,6 +590,7 @@ class Agent:
         self.actor = Actor(env.observation_space, env.action_space,
                            self.state_size,
                            config.hparams.actor_layers,
+                           use_sde=config.hparams.use_sde,
                            lr=config.hparams.actor_lr)
 
         self.transition_net = MLP(self.state_size + self.action_dim,
@@ -624,6 +625,7 @@ class Agent:
 
         self.train_metrics = MetricTracker('vfe', 'efe_mse_loss', 'success_rate', 'reward',
                                            'transition_net_grad', 'actor_grad_acc', 'value_net_grad',
+                                           'sde_std',
                                            writer=self.writer)
 
         self.val_metrics = MetricTracker('success_rate', 'reward', writer=self.writer)
@@ -698,6 +700,8 @@ class Agent:
         return torch.mean(vfe_batch)
 
     def _update_network(self):
+        if self.use_sde:
+            self.actor.reset_noise()
         # Retrieve transition data in mini batches:
         (state_batch_t0, state_batch_t1, state_batch_t2,
          actions_batch_t0, actions_batch_t1, actions_batch_t2,
@@ -830,6 +834,9 @@ class Agent:
                 self.train_metrics.update('actor_grad_acc', actor_grad_acc / self.n_batches)
                 self.train_metrics.update('value_net_grad', value_net_grad_acc / self.n_batches)
 
+                if self.use_sde:
+                    self.train_metrics.update('sde_std', (self.actor.get_std()).mean().item())
+
                 # soft update
                 if cycle % self.target_update_interval == 0:
                     self._soft_update_target_network(self.target_net, self.value_net)
@@ -884,6 +891,9 @@ class Agent:
         observation = native_observation['observation']
         achieved_goal = native_observation['achieved_goal']
         desired_goal = native_observation['desired_goal']
+
+        if self.use_sde:
+            self.actor.reset_noise()
 
         return observation, achieved_goal, desired_goal, False, 0
 
