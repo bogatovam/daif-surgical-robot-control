@@ -1,4 +1,6 @@
 device_id: cpu
 render_mode: human
-memory_capacity: 1024000
-batch_size: 256
+
+hparams:
+  memory_capacity: 1024000
+  batch_size: 512

@@ -1,14 +1,25 @@
 env_id: "NeedleReach-v0"
-freeze_period: 25
-gamma: 1.00
-beta: 0.99
+
 print_timer: 100
-n_sampled_actions: 128
-noise_eps: 0.2
-random_eps: 0.3
 
+hparams:
+  polyak: 0.95
 # HER
-replay_strategy: future
-replay_k: 4
+  replay_strategy: future
+  replay_k: 4
 
-polyak: 0.95
+#  Networks
+  use_sde: False
+  actor_layers:  [512, 1024, 512]
+  transition_net_layers: [128, 256, 64]
+  value_net_layers: [128, 256, 64]
+
+  actor_lr: 0.0003
+  transition_net_lr: 0.0003
+  value_net_lr: 0.0003
+
+  noise_eps: 0.2
+  random_eps: 0.3
+  entropy_coeff: 0.99
+  gamma: 1.00
+  beta: 0.99

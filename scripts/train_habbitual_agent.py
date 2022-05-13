@@ -86,13 +86,13 @@ class ReplayBuffer:
         self.achieved_goal_memory = np.empty([self.size, self.max_episode_steps, self.goal_dim], dtype=np.float32)
         self.desired_goal_memory = np.empty([self.size, self.max_episode_steps, self.goal_dim], dtype=np.float32)
         self.actions_memory = np.empty([self.size, self.max_episode_steps, self.action_dim], dtype=np.float32)
-        self.log_prob_memory = np.empty([self.size, self.max_episode_steps, 1], dtype=np.float32)
+        self.done_memory = np.empty([self.size, self.max_episode_steps, 1], dtype=np.float32)
 
         # thread lock
         self.lock = threading.Lock()
 
     # store the episode
-    def store_episode(self, observation, achieved_goal, desired_goal, action, log_prob, n_episodes_to_store):
+    def store_episode(self, observation, achieved_goal, desired_goal, action, done, n_episodes_to_store):
         with self.lock:
             ids = self._get_storage_idx(inc=n_episodes_to_store)
             # store the information
@@ -100,7 +100,7 @@ class ReplayBuffer:
             self.achieved_goal_memory[ids] = achieved_goal
             self.desired_goal_memory[ids] = desired_goal
             self.actions_memory[ids] = action
-            self.log_prob_memory[ids] = log_prob
+            self.done_memory[ids] = done
 
             self.n_transitions_stored += self.max_episode_steps * n_episodes_to_store
 
@@ -110,11 +110,11 @@ class ReplayBuffer:
         achieved_goal_buffer = self.achieved_goal_memory[:self.current_size]
         desired_goal_buffer = self.desired_goal_memory[:self.current_size]
         actions_buffer = self.actions_memory[:self.current_size]
-        log_prob_buffer = self.log_prob_memory[:self.current_size]
+        done_buffer = self.done_memory[:self.current_size]
 
         return self.sample_func(observation_buffer,
                                 achieved_goal_buffer, desired_goal_buffer,
-                                actions_buffer, log_prob_buffer,
+                                actions_buffer, done_buffer,
                                 batch_size)
 
     def _get_storage_idx(self, inc=None):
@@ -135,7 +135,7 @@ class ReplayBuffer:
 
 
 class HERSampler:
-    def __init__(self, replay_strategy, replay_k, reward_func=None, done_func=None):
+    def __init__(self, replay_strategy, replay_k, reward_func=None):
         self.replay_strategy = replay_strategy
         self.replay_k = replay_k
         if self.replay_strategy == 'future':
@@ -143,19 +143,10 @@ class HERSampler:
         else:
             self.future_p = 0
         self.reward_func = reward_func
-        self.done_func = done_func
-
-        # When sampling from memory at index i, obs_indices indicates that we want observations
-        # with indices i-obs_indices, works the same for the others
-        self.obs_indices = [2, 1, 0]
-        self.action_indices = [2, 1]
-        self.reward_indices = [1]
-        self.done_indices = [0]
-        self.max_n_indices = max(max(self.obs_indices, self.action_indices, self.reward_indices, self.done_indices)) + 1
 
     def sample_her_transitions(self, observation_buffer,
                                achieved_goal_buffer, desired_goal_buffer,
-                               actions_buffer, log_prob_buffer, batch_size):
+                               actions_buffer, batch_size):
         # Trajectory length
         trajectory_length = actions_buffer.shape[1]
 
@@ -173,27 +164,25 @@ class HERSampler:
         her_indexes = np.where(np.random.uniform(size=batch_size) < self.future_p)
 
         # previous
-        t0 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer,
-                                   actions_buffer, log_prob_buffer,
+        t0 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
                                    episode_ids, t_samples, her_indexes,
                                    batch_size=batch_size, time=0)
         # current
-        t1 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer,
-                                   actions_buffer, log_prob_buffer,
+        t1 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
                                    episode_ids, t_samples, her_indexes,
                                    batch_size=batch_size, time=1)
         # next
-        t2 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer,
-                                   actions_buffer, log_prob_buffer,
+        t2 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
                                    episode_ids, t_samples, her_indexes,
                                    batch_size=batch_size, time=2)
 
-        (_, achieved_goal_batch_t1, desired_goal_batch_t1, _, _) = t1
+        (_, achieved_goal_batch_t1, desired_goal_batch_t1, _) = t1
+
         # Recompute the reward for the augmented 'desired_goal'
-        # todo use achieved_goal_batch_t2 and desired_goal_batch_t1
+        # todo use achieved_goal_batch_t2 and desired_goal_batch_t1?
         reward_batch = self.reward_func(achieved_goal_batch_t1, desired_goal_batch_t1, info=None)
         # Recompute the termination state for the augmented 'desired_goal'
-        done_batch = self.done_func(achieved_goal_batch_t1, desired_goal_batch_t1, info=None)
+        done_batch = reward_batch == 0
 
         # Reshape the batch
         reward_batch = reward_batch.reshape(batch_size, *reward_batch.shape[1:])
@@ -201,8 +190,7 @@ class HERSampler:
 
         return t0, t1, t2, reward_batch, done_batch
 
-    def _sample_for_time(self, observation_buffer, achieved_goal_buffer, desired_goal_buffer,
-                         actions_buffer, log_prob_buffer,
+    def _sample_for_time(self, observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
                          episode_idxs, t_samples, her_indexes, batch_size, time):
         # Trajectory length
         trajectory_length = actions_buffer.shape[1] - 3
@@ -211,14 +199,12 @@ class HERSampler:
         achieved_goal_batch = achieved_goal_buffer[:, time:, :][episode_idxs, t_samples].copy()
         desired_goal_batch = desired_goal_buffer[:, time:, :][episode_idxs, t_samples].copy()
         actions_batch = actions_buffer[:, time:, :][episode_idxs, t_samples].copy()
-        log_prob_batch = log_prob_buffer[:, time:, :][episode_idxs, t_samples].copy()
 
         # Reshape the batch
         observation_batch = observation_batch.reshape(batch_size, *observation_batch.shape[1:])
         achieved_goal_batch = achieved_goal_batch.reshape(batch_size, *achieved_goal_batch.shape[1:])
         desired_goal_batch = desired_goal_batch.reshape(batch_size, *desired_goal_batch.shape[1:])
         actions_batch = actions_batch.reshape(batch_size, *actions_batch.shape[1:])
-        log_prob_batch = log_prob_batch.reshape(batch_size, *log_prob_batch.shape[1:])
 
         # Sample 'future' timestamps for each 't_samples'
         future_offset = np.random.uniform(size=batch_size) * (trajectory_length - t_samples)
@@ -230,7 +216,7 @@ class HERSampler:
         # Replace the 'desired_goal' with the 'next_achieved_goal'
         desired_goal_batch[her_indexes] = next_achieved_goal
 
-        return observation_batch, achieved_goal_batch, desired_goal_batch, actions_batch, log_prob_batch
+        return observation_batch, achieved_goal_batch, desired_goal_batch, actions_batch
 
 
 class Normalizer:
@@ -427,7 +413,7 @@ class SquashedDiagGaussianDistribution(DiagGaussianDistribution):
 
 
 class Actor(BasePolicy):
-
+    # todo distribution
     def __init__(
             self,
             observation_space: gym.spaces.Space,
@@ -435,7 +421,7 @@ class Actor(BasePolicy):
             input_size,
             net_arch,
             weight_decay=0.00001,
-            lr=0.0005,
+            lr=0.0001,
             activation_fn=nn.ReLU,
             use_sde: bool = False,
             log_std_init: float = -3,
@@ -471,6 +457,15 @@ class Actor(BasePolicy):
         self.mu = nn.Sequential(self.mu, nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean))
 
         self.log_std = nn.Linear(last_layer_dim, action_dim)
+        torch.nn.init.xavier_normal_(self.log_std.weight)
+
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_normal_(m.weight)
+                m.bias.data.fill_(0.01)
+
+        self.latent_pi.apply(init_weights)
+        self.mu.apply(init_weights)
 
         self.optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -523,7 +518,7 @@ class Actor(BasePolicy):
 
 
 class MLP(BaseModel):
-    def __init__(self, input_size, layer_sizes, output_size, lr=0.0005, output_activation=torch.nn.Identity,
+    def __init__(self, input_size, layer_sizes, output_size, lr=0.0001, output_activation=torch.nn.Identity,
                  activation=torch.nn.SiLU, weight_decay=1e-6, device='cpu'):
         super(MLP, self).__init__()
         sizes = [input_size] + layer_sizes + [output_size]
@@ -535,6 +530,13 @@ class MLP(BaseModel):
 
         self.layers = nn.ModuleList(self.layers)
         self.optimizer = optim.Adam(self.parameters(), lr, weight_decay=weight_decay)  # Adam optimizer
+
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_normal_(m.weight)
+                m.bias.data.fill_(0.01)
+
+        self.layers.apply(init_weights)
 
         self.device = device
         self.to(self.device)
@@ -555,26 +557,20 @@ class Agent:
 
         self.device = config.device_id
 
-        self.polyak = int(config.polyak)
+        self.polyak = int(config.hparams.polyak)
 
-        self.n_epochs = int(config.n_epochs)
-        self.n_cycles = int(config.n_cycles)
-        self.n_episodes = int(config.n_episodes)
-        self.n_batches = int(config.n_batches)
-        self._max_episode_steps = int(config.max_episode_steps)
+        self.n_epochs = int(config.hparams.n_epochs)
+        self.n_cycles = int(config.hparams.n_cycles)
+        self.n_episodes = int(config.hparams.n_episodes)
+        self.n_batches = int(config.hparams.n_batches)
+        self._max_episode_steps = env._max_episode_steps
 
-        self.batch_size = int(config.batch_size)
-        self.memory_capacity = int(config.memory_capacity)
+        self.batch_size = int(config.hparams.batch_size)
+        self.memory_capacity = int(config.hparams.memory_capacity)
 
-        self.freeze_period = int(config.freeze_period)
-
-        self.gamma = float(config.gamma)  # A precision parameter
-        self.beta = float(config.beta)  # The discount rate
-        self.noise_eps = float(config.noise_eps)  # The discount rate
-        self.random_eps = float(config.random_eps)  # The discount rate
-        self.random_eps = float(config.random_eps)  # The discount rate
-
-        self.print_timer = int(config.print_timer)
+        self.gamma = float(config.hparams.gamma)  # A precision parameter
+        self.beta = float(config.hparams.beta)  # The discount rate
+        self.entropy_coeff = float(config.hparams.entropy_coeff)  # The discount rate
 
         self.should_save_model = interpret_boolean(config.should_save_model)
         self.model_path = prepare_path(config.model_path, experiment_name=config.experiment_name)
@@ -591,28 +587,31 @@ class Agent:
         self.actions_shape = self.env.action_space.shape
         self.action_dim = self.env.action_space.shape[-1]
 
-        self.n_sampled_actions = config.n_sampled_actions
-        self.freeze_cntr = 0
-
         self.actor = Actor(env.observation_space, env.action_space,
                            self.state_size,
-                           [256, 256, 256])
+                           config.hparams.actor_layers,
+                           lr=config.hparams.actor_lr)
 
         self.transition_net = MLP(self.state_size + self.action_dim,
-                                  [64, 128, 64], self.state_size, lr=0.0005,
+                                  config.hparams.transition_net_layers,
+                                  self.state_size,
+                                  lr=config.hparams.value_net_lr,
                                   device=self.device)
 
         self.value_net = MLP(self.state_size + self.action_dim,
-                             [256, 256, 256],
-                             1, device=self.device)
+                             config.hparams.value_net_layers,
+                             1,
+                             lr=config.hparams.value_net_lr,
+                             device=self.device)
         self.target_net = MLP(self.state_size + self.action_dim,
-                              [256, 256, 256],
-                              1, device=self.device)
+                              config.hparams.value_net_layers,
+                              1,
+                              lr=config.hparams.value_net_lr,
+                              device=self.device)
 
-        self.her_module = HERSampler(config.replay_strategy, config.replay_k, self.env.compute_reward,
-                                     self.env.compute_reward)
+        self.her_module = HERSampler(config.hparams.replay_strategy, config.hparams.replay_k, self.env.compute_reward)
         # create the replay buffer
-        self.buffer = ReplayBuffer(self.env, config.max_episode_steps, self.memory_capacity,
+        self.buffer = ReplayBuffer(self.env, self._max_episode_steps, self.memory_capacity,
                                    self.her_module.sample_her_transitions, config.device_id)
 
         self.o_norm = Normalizer(size=env.observation_space.spaces['observation'].shape[0])
@@ -623,17 +622,23 @@ class Agent:
         self.writer = TensorboardWriter(prepare_path(config.tb_log_folder, experiment_name=config.experiment_name),
                                         True)
 
-        self.metrics = MetricTracker('vfe', 'efe_mse_loss', 'success_rate', 'reward', 'elapsed_steps_count',
-                                     'transition_net_grad', 'actor_grad_acc', 'value_net_grad', writer=self.writer)
+        self.train_metrics = MetricTracker('vfe', 'efe_mse_loss', 'success_rate', 'reward',
+                                           'transition_net_grad', 'actor_grad_acc', 'value_net_grad',
+                                           writer=self.writer)
+
+        self.val_metrics = MetricTracker('success_rate', 'reward', writer=self.writer)
+
+        # just to save model configuration to logs
+        self.writer.add_hparams(config.hparams.__dict__, {}, run_name=config.experiment_name)
 
     def get_mini_batches(self):
         # Retrieve transition data in mini batches
         t0, t1, t2, reward_batch, done_batch = self.buffer.sample(self.batch_size)
 
         # Retrieve a batch for 3 consecutive points in time
-        (observation_batch_t0, achieved_goal_batch_t0, desired_goal_batch_t0, actions_batch_t0, log_prob_batch_t0) = t0
-        (observation_batch_t1, achieved_goal_batch_t1, desired_goal_batch_t1, actions_batch_t1, log_prob_batch_t1) = t1
-        (observation_batch_t2, achieved_goal_batch_t2, desired_goal_batch_t2, actions_batch_t2, log_prob_batch_t2) = t2
+        (observation_batch_t0, achieved_goal_batch_t0, desired_goal_batch_t0, actions_batch_t0) = t0
+        (observation_batch_t1, achieved_goal_batch_t1, desired_goal_batch_t1, actions_batch_t1) = t1
+        (observation_batch_t2, achieved_goal_batch_t2, desired_goal_batch_t2, actions_batch_t2) = t2
 
         state_batch_t0 = self._preprocess_batch_inputs(observation_batch_t0, desired_goal_batch_t0)
         state_batch_t1 = self._preprocess_batch_inputs(observation_batch_t1, desired_goal_batch_t1)
@@ -643,10 +648,6 @@ class Agent:
         actions_batch_t1 = self.as_tensor(actions_batch_t1)
         actions_batch_t2 = self.as_tensor(actions_batch_t2)
 
-        log_prob_batch_t0 = self.as_tensor(log_prob_batch_t0)
-        log_prob_batch_t1 = self.as_tensor(log_prob_batch_t1)
-        log_prob_batch_t2 = self.as_tensor(log_prob_batch_t2)
-
         reward_batch, done_batch = self.as_tensor(reward_batch), self.as_tensor(done_batch)
 
         # At time t0 predict the state at time t1:
@@ -655,96 +656,71 @@ class Agent:
         pred_batch_t0t1 = self.transition_net(X)
 
         # Determine the prediction error wrt time t0-t1:
-        pred_error_batch_t0t1 = torch.mean(F.mse_loss(
-            pred_batch_t0t1, state_batch_t1, reduction='none'), dim=1).unsqueeze(1)
+        pred_error_batch_t0t1 = torch.mean(
+            F.mse_loss(pred_batch_t0t1, state_batch_t1, reduction='none'), dim=1).unsqueeze(1)
 
         return (state_batch_t0, state_batch_t1, state_batch_t2,
                 actions_batch_t0, actions_batch_t1, actions_batch_t2,
-                log_prob_batch_t0, log_prob_batch_t1, log_prob_batch_t2,
                 reward_batch, done_batch, pred_error_batch_t0t1)
 
     def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
                                actions_batch_t1, actions_batch_t2,
-                               log_prob_batch_t1, log_prob_batch_t2,
                                reward_batch, done_batch, pred_error_batch_t0t1):
 
         with torch.no_grad():
+            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
+
             targe_net_input = torch.cat([state_batch_t2, actions_batch_t2], dim=1)
             target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-            action_probs_t2 = torch.exp(log_prob_batch_t2).clamp(0, 1)
 
-            # Weigh the target EFEs according to the action distribution:
-            weighted_targets = (action_probs_t2 * target_expected_free_energies_batch_t2).sum(-1).unsqueeze(1)
+            # H_t2 ~ -log_prob_t2
+            weighted_targets = target_expected_free_energies_batch_t2 - self.entropy_coeff * log_prob_t2.reshape(-1, 1)
 
             # Determine the batch of bootstrapped estimates of the EFEs:
             expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + self.beta * weighted_targets)
+                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
 
         # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output = self.value_net(value_net_input)
-        action_probs_t1 = torch.exp(log_prob_batch_t1).clamp(0, 1)
-
-        efe_batch_t1 = value_net_output
+        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
+        value_net_output_t1 = self.value_net(value_net_input_t1)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
-        value_net_loss = F.mse_loss(expected_free_energy_estimate_batch, efe_batch_t1)
-        return value_net_loss
+        return 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
 
     def compute_variational_free_energy(self, state_batch_t1, pred_error_batch_t0t1):
+        # согласно статье должно быть через репараметризацию
         predicted_actions_t1, pred_log_prob_t1 = self.actor.action_log_prob(state_batch_t1)
-        action_probs_t1 = torch.exp(pred_log_prob_t1).clamp(0, 1).unsqueeze(1)
 
         value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-
         expected_free_energy_t1 = self.value_net(value_net_input)
 
-        # Take a gamma-weighted Boltzmann distribution over the EFEs:
-        boltzmann_expected_free_energy_batch_t1 = torch.sigmoid(-self.gamma * expected_free_energy_t1)
-        boltzmann_expected_free_energy_batch_t1 = boltzmann_expected_free_energy_batch_t1.clamp(min=1e-9, max=1 - 1e-9)
-
-        # Weigh them according to the action distribution:
-        energy_batch = -(action_probs_t1 * torch.log(boltzmann_expected_free_energy_batch_t1)).view(self.batch_size, 1)
-
-        # Determine the entropy of the action distribution
-        entropy_batch = -(action_probs_t1 * torch.log(action_probs_t1)).view(self.batch_size, 1)
-
-        # Determine the Variable Free Energy, then take the mean over all batch samples:
-        vfe_batch = pred_error_batch_t0t1 + energy_batch - entropy_batch
-        vfe = torch.mean(vfe_batch)
-        return vfe
+        vfe_batch = pred_error_batch_t0t1 + self.entropy_coeff * pred_log_prob_t1 - expected_free_energy_t1
+        return torch.mean(vfe_batch)
 
     def _update_network(self):
         # Retrieve transition data in mini batches:
         (state_batch_t0, state_batch_t1, state_batch_t2,
          actions_batch_t0, actions_batch_t1, actions_batch_t2,
-         log_prob_batch_t0, log_prob_batch_t1, log_prob_batch_t2,
          reward_batch, done_batch, pred_error_batch_t0t1) = self.get_mini_batches()
         # Compute the value network loss:
 
         value_net_loss = self.compute_value_net_loss(state_batch_t1, state_batch_t2,
                                                      actions_batch_t1, actions_batch_t2,
-                                                     log_prob_batch_t1, log_prob_batch_t2,
                                                      reward_batch, done_batch, pred_error_batch_t0t1)
         self.transition_net.optimizer.zero_grad()
 
         self.value_net.optimizer.zero_grad()
         value_net_loss.backward()
-
         value_net_grad = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 100000.)
-
         self.value_net.optimizer.step()
-
-        # Compute the variational free energy:
-        vfe = self.compute_variational_free_energy(state_batch_t1, pred_error_batch_t0t1)
 
         # Optimize the actor
         self.actor.optimizer.zero_grad()
+        # Compute the variational free energy:
+        vfe = self.compute_variational_free_energy(state_batch_t1, pred_error_batch_t0t1)
         vfe.backward()
-
         actor_grad = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100000.)
         transition_net_grad = torch.nn.utils.clip_grad_norm_(self.transition_net.parameters(), 100000.)
-
         self.actor.optimizer.step()
         self.transition_net.optimizer.step()
 
@@ -758,59 +734,45 @@ class Agent:
     # do the evaluation
     def _eval_agent(self, epoch):
         images = []
-        total_reward = []
-        total_success_rate = []
-        elapsed_steps_count = []
+        reward = []
+        done = []
+        episode_step = 0
 
-        for cycle in range(epoch):
-            per_reward = []
-            observation, _, desired_goal, _, reward = self._reset()
+        observation, _, desired_goal, _, _ = self._reset()
+        while episode_step < self._max_episode_steps:
+            input_tensor = self._preprocess_inputs(observation, desired_goal)
+            action = self._select_action(input_tensor)
 
-            done = False
-            episode_step = 0
-            while not done and episode_step < self._max_episode_steps:
-                input_tensor = self._preprocess_inputs(observation, desired_goal)
-                action = self._select_action(input_tensor)
+            new_observation, reward, _, info = self.env.step(action)
 
-                # feed the actions into the environment
-                new_observation, reward, done, info = self.env.step(action)
+            observation = new_observation['observation']
+            reward.append(reward)
+            done.append(info['is_success'])
+            episode_step += 1
 
-                observation = new_observation['observation']
-                per_reward.append(reward)
-                episode_step += 1
+            if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
+                images += [self.env.render(mode='rgb_array')]
 
-                # if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
-                #     images += [self.env.render()]
-
-            total_reward.append(np.mean(per_reward))
-            total_success_rate.append(1 if done and episode_step < self._max_episode_steps else 0)
-            elapsed_steps_count.append(episode_step)
-
-        total_reward = np.asarray(total_reward)
-        total_success_rate = np.asarray(total_success_rate)
-        elapsed_steps_count = np.asarray(elapsed_steps_count)
-        return np.mean(total_success_rate), np.mean(total_reward), np.asarray(images), np.mean(elapsed_steps_count)
+        return np.mean(np.asarray(done)), np.mean(np.asarray(reward)), np.asarray(images)
 
     def train(self):
         self.writer.add_text(self.experiment_name, self.experiment_description)
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
         for epoch in range(self.n_epochs):
-            for step in range(self.n_cycles):
-                self.writer.set_step(self.n_cycles * epoch + step)
-
-                cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [],
-                              'action': [], 'log_prob': []}
+            for cycle in range(self.n_cycles):
+                step = self.n_cycles * epoch + cycle
+                self.writer.set_step(step)
 
                 cycle_summary_data = {'done': [], 'reward': []}
+                cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
 
                 for _ in range(self.n_episodes):
                     observation, achieved_goal, desired_goal, done, reward = self._reset()
 
-                    episode_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [],
-                                    'action': [], 'log_prob': []}
+                    episode_summary_data = {'done': [], 'reward': []}
+                    episode_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
 
-                    episode_summary_data = {'done_step': self._max_episode_steps, 'reward': []}
                     for episode_step in range(self._max_episode_steps):
                         input_tensor = self._preprocess_inputs(observation, desired_goal)
                         action, log_prob = self._select_action(input_tensor)
@@ -819,14 +781,12 @@ class Agent:
                         episode_data['achieved_goal'].append(achieved_goal.copy())
                         episode_data['desired_goal'].append(desired_goal.copy())
                         episode_data['action'].append(action.copy())
-                        episode_data['log_prob'].append(log_prob.copy())
 
                         # feed the actions into the environment
-                        new_observation, reward, done, _ = self.env.step(action)
+                        new_observation, reward, _, info = self.env.step(action)
 
-                        if done:
-                            episode_summary_data['done_step'] = episode_step
                         episode_summary_data['reward'].append(np.mean(reward))
+                        episode_summary_data['done'].append(info['is_success'])
 
                         observation = new_observation['observation']
                         achieved_goal = new_observation['achieved_goal']
@@ -835,16 +795,14 @@ class Agent:
                     cycle_data['achieved_goal'].append(np.asarray(episode_data['achieved_goal'], dtype=np.float32))
                     cycle_data['desired_goal'].append(np.asarray(episode_data['desired_goal'], dtype=np.float32))
                     cycle_data['action'].append(np.asarray(episode_data['action'], dtype=np.float32))
-                    cycle_data['log_prob'].append(np.asarray(episode_data['log_prob'], dtype=np.float32))
 
-                    cycle_summary_data['done'].append(episode_summary_data['done_step'] < self._max_episode_steps)
+                    cycle_summary_data['done'].append(np.mean(episode_summary_data['done']))
                     cycle_summary_data['reward'].append(np.mean(episode_summary_data['reward']))
 
                 cycle_data['observation'] = np.asarray(cycle_data['observation'], dtype=np.float32)
                 cycle_data['achieved_goal'] = np.asarray(cycle_data['achieved_goal'], dtype=np.float32)
                 cycle_data['desired_goal'] = np.asarray(cycle_data['desired_goal'], dtype=np.float32)
                 cycle_data['action'] = np.asarray(cycle_data['action'], dtype=np.float32)
-                cycle_data['log_prob'] = np.asarray(cycle_data['log_prob'], dtype=np.float32)
 
                 cycle_summary_data['done'] = np.asarray(cycle_summary_data['done'], dtype=np.float32)
                 cycle_summary_data['reward'] = np.asarray(cycle_summary_data['reward'], dtype=np.float32)
@@ -866,31 +824,34 @@ class Agent:
                     actor_grad_acc += actor_grad
                     value_net_grad_acc += value_net_grad
 
-                self.metrics.update('vfe', np.mean(vfe))
-                self.metrics.update('efe_mse_loss', np.mean(value_net_loss))
-                self.metrics.update('transition_net_grad', transition_net_grad_acc / self.n_batches)
-                self.metrics.update('actor_grad_acc', actor_grad_acc / self.n_batches)
-                self.metrics.update('value_net_grad', value_net_grad_acc / self.n_batches)
+                self.train_metrics.update('vfe', np.mean(vfe))
+                self.train_metrics.update('efe_mse_loss', np.mean(value_net_loss))
+                self.train_metrics.update('transition_net_grad', transition_net_grad_acc / self.n_batches)
+                self.train_metrics.update('actor_grad_acc', actor_grad_acc / self.n_batches)
+                self.train_metrics.update('value_net_grad', value_net_grad_acc / self.n_batches)
 
                 # soft update
-                if step % self.target_update_interval == 0:
+                if cycle % self.target_update_interval == 0:
                     self._soft_update_target_network(self.target_net, self.value_net)
-                # val_success_rate, val_reward, images, elapsed_steps_count = self._eval_agent(10)
-                val_success_rate = np.mean(cycle_summary_data['done'])
-                val_reward = np.mean(cycle_summary_data['reward'])
 
-                self.metrics.update('success_rate', val_success_rate)
-                self.metrics.update('reward', val_reward)
+                success_rate = np.mean(cycle_summary_data['done'])
+                reward = np.mean(cycle_summary_data['reward'])
+
+                self.train_metrics.update('success_rate', success_rate)
+                self.train_metrics.update('reward', reward)
                 self.log_models_parameters()
 
-                print(
-                    "Epoch: {:4d}, Step: {:4d}, reward: {:3.2f}, success_rate: {:3.2f}".format(epoch, step, val_reward,
-                                                                                               val_success_rate))
+                print("Epoch: {:4d}, Step: {:4d}, reward: {:3.2f}, success_rate: {:3.2f}".format(epoch, cycle,
+                                                                                                 reward,
+                                                                                                 success_rate))
 
-                # plot_grad_flow(self.prediction_policy_mu_network.named_parameters())
+            success_rate, reward, images = self._eval_agent(epoch)
 
-            # if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
-            #     self.writer.add_video(self.experiment_name + f'_{epoch}', images)
+            self.val_metrics.update('success_rate', success_rate)
+            self.val_metrics.update('reward', reward)
+
+            if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
+                self.writer.add_video(self.experiment_name + f'_{epoch}', images)
 
             if self.should_save_model and epoch > 0 and epoch % self.model_save_timer == 0:
                 self.transition_net.save(os.path.join(self.model_path, 'transition_net.pth'))
@@ -917,24 +878,19 @@ class Agent:
             self.writer.add_histogram('value_net_' + name, p, bins='auto')
 
     def _reset(self):
-        self.metrics.reset()
+        self.train_metrics.reset()
         native_observation = self.env.reset()
 
         observation = native_observation['observation']
         achieved_goal = native_observation['achieved_goal']
         desired_goal = native_observation['desired_goal']
 
-        # observation = torch.tensor(observation, dtype=torch.float32, device=self.device)
-        # achieved_goal = torch.tensor(achieved_goal, dtype=torch.float32, device=self.device)
-        # desired_goal = torch.tensor(desired_goal, dtype=torch.float32, device=self.device)
-
         return observation, achieved_goal, desired_goal, False, 0
 
     def _select_action(self, input_tensor):
         with torch.no_grad():
-            action, log_prob = self.actor.action_log_prob(input_tensor)
-            # action = torch.clip(action, self.env.action_space.low[0], self.env.action_space.high[0])
-            return action.cpu().numpy().flatten(), log_prob.cpu().numpy().flatten()
+            action = self.actor.predict(input_tensor)
+            return action.cpu().numpy().flatten()
 
     def _sample_actions_with_probs(self, input_tensor, n_samples):
         # input_tensor.shape = (batch_size, obs_dim + desired_goal)
@@ -952,23 +908,6 @@ class Agent:
         # actions = self.a_norm.normalize(actions)
         return mu, log_variance, actions, probs
 
-    def _infer_action_using_reparameterization(self, mu, log_variance):
-        # Apply reparameterization trick
-        std = self._variance2std(log_variance)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    @staticmethod
-    def _variance2std(log_variance):
-        return torch.exp(0.5 * log_variance)
-
-    @staticmethod
-    def _log_prob(value, loc, scale):
-        # compute the variance
-        var = torch.pow(scale, 2)
-        log_scale = torch.log(scale)
-        return -((value.detach() - loc) ** 2) / (2 * var) - log_scale - math.log(math.sqrt(2 * math.pi))
-
     def _preprocess_inputs(self, observation, goal):
         observation = self.o_norm.normalize(observation)
         goal = self.g_norm.normalize(goal)
@@ -983,16 +922,16 @@ class Agent:
         inputs = np.concatenate([observation_batch, goal_batch], axis=1)
         return torch.tensor(inputs, dtype=torch.float32, device=self.device)
 
-    def _update_normalizer(self, observation, achieved_goal, desired_goal, action, log_prob):
+    def _update_normalizer(self, observation, achieved_goal, desired_goal, action):
         # get the number of normalization transitions
         num_transitions = action.shape[0]
         # create the new buffer to store them
         t0, t1, t2, reward_batch, done_batch = self.her_module.sample_her_transitions(observation, achieved_goal,
                                                                                       desired_goal,
-                                                                                      action, log_prob,
+                                                                                      action,
                                                                                       num_transitions)
 
-        (observation_batch, _, desired_goal_batch, actions, _) = t0
+        (observation_batch, _, desired_goal_batch, actions) = t0
 
         # update
         self.o_norm.update(observation_batch)
