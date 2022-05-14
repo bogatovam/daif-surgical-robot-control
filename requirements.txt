@@ -10,3 +10,4 @@ omegaconf
 jupyterlab
 sympy
 stable-baselines3
+moviepy

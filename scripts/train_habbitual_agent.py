@@ -10,24 +10,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from stable_baselines3.common.utils import polyak_update
 
 import surrol.gym as surrol_gym
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
+from omegaconf import OmegaConf
 from stable_baselines3.common.distributions import StateDependentNoiseDistribution, \
-    TanhBijector, DiagGaussianDistribution
+    TanhBijector, DiagGaussianDistribution, SquashedDiagGaussianDistribution
 from stable_baselines3.common.preprocessing import get_action_dim, is_image_space, maybe_transpose
 from stable_baselines3.common.torch_layers import create_mlp
-from stable_baselines3.common.utils import obs_as_tensor
-from torch.distributions import Normal
 
+import utils
 from base import BaseModel
 from config.configs_reader import get_config
 import gym
 
 from config.const import ROOT_DIR_PATH
 from logger import TensorboardWriter
-from utils import MetricTracker
+from utils import MetricTracker, create_dirs
 
 import threading
 import numpy as np
@@ -65,8 +66,7 @@ import gym
 
 import threading
 import numpy as np
-
-torch.autograd.set_detect_anomaly(True)
+import imageio
 
 
 class ReplayBuffer:
@@ -86,13 +86,12 @@ class ReplayBuffer:
         self.achieved_goal_memory = np.empty([self.size, self.max_episode_steps, self.goal_dim], dtype=np.float32)
         self.desired_goal_memory = np.empty([self.size, self.max_episode_steps, self.goal_dim], dtype=np.float32)
         self.actions_memory = np.empty([self.size, self.max_episode_steps, self.action_dim], dtype=np.float32)
-        self.done_memory = np.empty([self.size, self.max_episode_steps, 1], dtype=np.float32)
 
         # thread lock
         self.lock = threading.Lock()
 
     # store the episode
-    def store_episode(self, observation, achieved_goal, desired_goal, action, done, n_episodes_to_store):
+    def store_episode(self, observation, achieved_goal, desired_goal, action, n_episodes_to_store):
         with self.lock:
             ids = self._get_storage_idx(inc=n_episodes_to_store)
             # store the information
@@ -100,7 +99,6 @@ class ReplayBuffer:
             self.achieved_goal_memory[ids] = achieved_goal
             self.desired_goal_memory[ids] = desired_goal
             self.actions_memory[ids] = action
-            self.done_memory[ids] = done
 
             self.n_transitions_stored += self.max_episode_steps * n_episodes_to_store
 
@@ -110,11 +108,10 @@ class ReplayBuffer:
         achieved_goal_buffer = self.achieved_goal_memory[:self.current_size]
         desired_goal_buffer = self.desired_goal_memory[:self.current_size]
         actions_buffer = self.actions_memory[:self.current_size]
-        done_buffer = self.done_memory[:self.current_size]
 
         return self.sample_func(observation_buffer,
                                 achieved_goal_buffer, desired_goal_buffer,
-                                actions_buffer, done_buffer,
+                                actions_buffer,
                                 batch_size)
 
     def _get_storage_idx(self, inc=None):
@@ -286,26 +283,7 @@ class BasePolicy(BaseModel, ABC):
         raise NotImplementedError
 
     def predict(self, observation):
-        self.set_training_mode(False)
-
-        observation = self.obs_to_tensor(observation)
-
-        with torch.no_grad():
-            actions = self._predict(observation)
-
-        # Convert to numpy
-        actions = actions.cpu().numpy()
-
-        if isinstance(self.action_space, gym.spaces.Box):
-            if self.squash_output:
-                # Rescale to proper domain when using squashing
-                actions = self.unscale_action(actions)
-            else:
-                # Actions could be on arbitrary scale, so clip the actions to avoid
-                # out of bound error (e.g. if sampling from a Gaussian distribution)
-                actions = np.clip(actions, self.action_space.low, self.action_space.high)
-
-        return actions
+        return self._predict(observation)
 
     def scale_action(self, action: np.ndarray) -> np.ndarray:
         """
@@ -349,67 +327,11 @@ class BasePolicy(BaseModel, ABC):
         else:
             observation = np.array(observation)
 
-        if not isinstance(observation, dict):
-            # Add batch dimension if needed
-            observation = observation.reshape((-1,) + self.observation_space.shape)
+        # if not isinstance(observation, dict):
+        #     # Add batch dimension if needed
+        #     observation = observation.reshape((-1,) + self.observation_space.shape)
 
-        observation = obs_as_tensor(observation, self.device)
         return observation
-
-
-class SquashedDiagGaussianDistribution(DiagGaussianDistribution):
-    """
-    Gaussian distribution with diagonal covariance matrix, followed by a squashing function (tanh) to ensure bounds.
-
-    :param action_dim: Dimension of the action space.
-    :param epsilon: small value to avoid NaN due to numerical imprecision.
-    """
-
-    def __init__(self, action_dim: int, epsilon: float = 1e-6):
-        super(SquashedDiagGaussianDistribution, self).__init__(action_dim)
-        # Avoid NaN (prevents division by zero or log of zero)
-        self.epsilon = epsilon
-        self.gaussian_actions = None
-
-    def proba_distribution(self, mean_actions: torch.Tensor,
-                           log_std: torch.Tensor) -> "SquashedDiagGaussianDistribution":
-        super(SquashedDiagGaussianDistribution, self).proba_distribution(mean_actions, log_std)
-        return self
-
-    def log_prob(self, actions: torch.Tensor, gaussian_actions: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Inverse tanh
-        # Naive implementation (not stable): 0.5 * torch.log((1 + x) / (1 - x))
-        # We use numpy to avoid numerical instability
-        if gaussian_actions is None:
-            # It will be clipped to avoid NaN when inversing tanh
-            gaussian_actions = TanhBijector.inverse(actions)
-
-        # Log likelihood for a Gaussian distribution
-        log_prob = super(SquashedDiagGaussianDistribution, self).log_prob(gaussian_actions)
-        # Squash correction (from original SAC implementation)
-        # this comes from the fact that tanh is bijective and differentiable
-        return log_prob
-
-    def entropy(self) -> Optional[torch.Tensor]:
-        # No analytical form,
-        # entropy needs to be estimated using -log_prob.mean()
-        return None
-
-    def sample(self) -> torch.Tensor:
-        # Reparametrization trick to pass gradients
-        self.gaussian_actions = super().sample()
-        return torch.tanh(self.gaussian_actions)
-
-    def mode(self) -> torch.Tensor:
-        self.gaussian_actions = super().mode()
-        # Squash the output
-        return torch.tanh(self.gaussian_actions)
-
-    def log_prob_from_params(self, mean_actions: torch.Tensor, log_std: torch.Tensor) -> Tuple[
-        torch.Tensor, torch.Tensor]:
-        action = self.actions_from_params(mean_actions, log_std)
-        log_prob = self.log_prob(action, self.gaussian_actions)
-        return action, log_prob
 
 
 class Actor(BasePolicy):
@@ -423,11 +345,11 @@ class Actor(BasePolicy):
             lr=0.0001,
             activation_fn=nn.ReLU,
             use_sde: bool = False,
-            log_std_init: float = -3,
+            log_std_init: float = -1,
             full_std: bool = True,
             sde_net_arch=None,
-            use_expln: bool = True,
-            clip_mean: float = 1.0,
+            use_expln: bool = False,
+            clip_mean: float = 2.0,
             normalize_images: bool = True,
     ):
         super().__init__(observation_space, action_space, normalize_images=normalize_images, squash_output=True)
@@ -466,6 +388,8 @@ class Actor(BasePolicy):
             self.action_dist = SquashedDiagGaussianDistribution(action_dim)
             self.mu = nn.Linear(last_layer_dim, action_dim)
             self.log_std = nn.Linear(last_layer_dim, action_dim)
+
+        self.optimizer = optim.Adam(self.parameters(), lr=lr)
 
     def _get_constructor_parameters(self):
         data = super()._get_constructor_parameters()
@@ -517,24 +441,12 @@ class Actor(BasePolicy):
 
 class MLP(BaseModel):
     def __init__(self, input_size, layer_sizes, output_size, lr=0.0001, output_activation=torch.nn.Identity,
-                 activation=torch.nn.SiLU, weight_decay=1e-6, device='cpu'):
+                 activation=torch.nn.ReLU, weight_decay=1e-6, device='cpu'):
         super(MLP, self).__init__()
-        sizes = [input_size] + layer_sizes + [output_size]
 
-        self.layers = []
-        for i in range(len(sizes) - 1):
-            act = activation if i < len(sizes) - 2 else output_activation
-            self.layers += [nn.Linear(sizes[i], sizes[i + 1]), act()]
-
+        self.layers = create_mlp(input_size, output_size, layer_sizes, activation)
         self.layers = nn.ModuleList(self.layers)
-        self.optimizer = optim.Adam(self.parameters(), lr, weight_decay=weight_decay)  # Adam optimizer
-
-        def init_weights(m):
-            if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_normal_(m.weight)
-                m.bias.data.fill_(0.01)
-
-        self.layers.apply(init_weights)
+        self.optimizer = optim.Adam(self.parameters(), lr)  # Adam optimizer
 
         self.device = device
         self.to(self.device)
@@ -558,6 +470,7 @@ class Agent:
         self.polyak = int(config.hparams.polyak)
 
         self.use_sde = int(config.hparams.use_sde)
+        self.learning_start = int(config.hparams.learning_start)
 
         self.n_epochs = int(config.hparams.n_epochs)
         self.n_cycles = int(config.hparams.n_cycles)
@@ -570,10 +483,12 @@ class Agent:
 
         self.gamma = float(config.hparams.gamma)  # A precision parameter
         self.beta = float(config.hparams.beta)  # The discount rate
-        self.entropy_coeff = float(config.hparams.entropy_coeff)  # The discount rate
+        self.alpha = config.hparams.alpha  # The discount rate
 
         self.should_save_model = interpret_boolean(config.should_save_model)
         self.model_path = prepare_path(config.model_path, experiment_name=config.experiment_name)
+        self.video_log_path = os.path.join(
+            prepare_path(config.video_log_folder, experiment_name=config.experiment_name), "epoch-{}.gif")
         self.final_model_path = os.path.join(self.model_path, "final")
         self.model_save_timer = int(config.model_save_timer)
 
@@ -589,26 +504,54 @@ class Agent:
 
         self.actor = Actor(env.observation_space, env.action_space,
                            self.state_size,
-                           config.hparams.actor_layers,
+                           OmegaConf.to_object(config.hparams.actor_layers),
                            use_sde=config.hparams.use_sde,
                            lr=config.hparams.actor_lr)
 
         self.transition_net = MLP(self.state_size + self.action_dim,
-                                  config.hparams.transition_net_layers,
+                                  OmegaConf.to_object(config.hparams.transition_net_layers),
                                   self.state_size,
                                   lr=config.hparams.value_net_lr,
                                   device=self.device)
 
         self.value_net = MLP(self.state_size + self.action_dim,
-                             config.hparams.value_net_layers,
+                             OmegaConf.to_object(config.hparams.value_net_layers),
                              1,
                              lr=config.hparams.value_net_lr,
                              device=self.device)
         self.target_net = MLP(self.state_size + self.action_dim,
-                              config.hparams.value_net_layers,
+                              OmegaConf.to_object(config.hparams.value_net_layers),
                               1,
                               lr=config.hparams.value_net_lr,
                               device=self.device)
+
+        # Target entropy is used when learning the entropy coefficient
+        if isinstance(self.alpha, str) and self.alpha.startswith("auto"):
+            # automatically set target entropy if needed
+            self.target_entropy = -np.prod(self.env.action_space.shape).astype(np.float32)
+        else:
+            # Force conversion
+            # this will also throw an error for unexpected string
+            self.target_entropy = float(self.target_entropy)
+
+        # The entropy coefficient or entropy can be learned automatically
+        # see Automating Entropy Adjustment for Maximum Entropy RL section
+        # of https://arxiv.org/abs/1812.05905
+        if isinstance(self.alpha, str) and self.alpha.startswith("auto"):
+            init_value = 1.0
+            if "_" in self.alpha:
+                init_value = float(self.alpha.split("_")[1])
+                assert init_value > 0.0, "The initial value of ent_coef must be greater than 0"
+
+            # Note: we optimize the log of the entropy coeff which is slightly different from the paper
+            # as discussed in https://github.com/rail-berkeley/softlearning/issues/37
+            self.log_alpha = torch.log(torch.ones(1, device=self.device) * init_value).requires_grad_(True)
+            self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=config.hparams.alpha_lr)
+        else:
+            # Force conversion to float
+            # this will throw an error if a malformed string (different from 'auto')
+            # is passed
+            self.alpha_tensor = torch.tensor(float(self.alpha)).to(self.device)
 
         self.her_module = HERSampler(config.hparams.replay_strategy, config.hparams.replay_k, self.env.compute_reward)
         # create the replay buffer
@@ -631,7 +574,13 @@ class Agent:
         self.val_metrics = MetricTracker('success_rate', 'reward', writer=self.writer)
 
         # just to save model configuration to logs
-        self.writer.add_hparams(config.hparams.__dict__, {}, run_name=config.experiment_name)
+        config_as_dict = OmegaConf.to_object(config.hparams)
+        config_as_dict['actor_layers'] = str(config_as_dict['actor_layers'])
+        config_as_dict['transition_net_layers'] = str(config_as_dict['transition_net_layers'])
+        config_as_dict['value_net_layers'] = str(config_as_dict['value_net_layers'])
+        config_as_dict['max_episode_steps'] = str(env._max_episode_steps)
+
+        # self.writer.add_hparams(config_as_dict, {}, run_name=config.experiment_name)
 
     def get_mini_batches(self):
         # Retrieve transition data in mini batches
@@ -667,7 +616,7 @@ class Agent:
 
     def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
                                actions_batch_t1, actions_batch_t2,
-                               reward_batch, done_batch, pred_error_batch_t0t1):
+                               reward_batch, done_batch, pred_error_batch_t0t1, alpha):
 
         with torch.no_grad():
             actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
@@ -676,41 +625,64 @@ class Agent:
             target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
 
             # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 - self.entropy_coeff * log_prob_t2.reshape(-1, 1)
+            weighted_targets = target_expected_free_energies_batch_t2 - alpha * log_prob_t2.reshape(-1, 1)
 
             # Determine the batch of bootstrapped estimates of the EFEs:
             expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
+                    reward_batch + -pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
 
         # Determine the Expected free energy at time t1 according to the value network:
         value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
         value_net_output_t1 = self.value_net(value_net_input_t1)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
-        return 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
+        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
+        return mse
 
-    def compute_variational_free_energy(self, state_batch_t1, pred_error_batch_t0t1):
-        # согласно статье должно быть через репараметризацию
-        predicted_actions_t1, pred_log_prob_t1 = self.actor.action_log_prob(state_batch_t1)
+    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
+                                        pred_error_batch_t0t1, alpha):
 
         value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
         expected_free_energy_t1 = self.value_net(value_net_input)
 
-        vfe_batch = pred_error_batch_t0t1 + self.entropy_coeff * pred_log_prob_t1 - expected_free_energy_t1
+        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 - expected_free_energy_t1
         return torch.mean(vfe_batch)
 
     def _update_network(self):
         if self.use_sde:
             self.actor.reset_noise()
+
         # Retrieve transition data in mini batches:
         (state_batch_t0, state_batch_t1, state_batch_t2,
          actions_batch_t0, actions_batch_t1, actions_batch_t2,
          reward_batch, done_batch, pred_error_batch_t0t1) = self.get_mini_batches()
         # Compute the value network loss:
 
+        # Action by the current actor for the sampled state
+        sampled_actions_t1, sampled_actions_log_prob_t1 = self.actor.action_log_prob(state_batch_t1)
+        sampled_actions_log_prob_t1 = sampled_actions_log_prob_t1.reshape(-1, 1)
+
+        alpha_loss = None
+        if self.alpha_optimizer is not None:
+            # Important: detach the variable from the graph
+            # so we don't change it with other losses
+            # see https://github.com/rail-berkeley/softlearning/issues/60
+            alpha = torch.exp(self.log_alpha.detach())
+            alpha_loss = -(self.log_alpha * (sampled_actions_log_prob_t1 + self.target_entropy).detach()).mean()
+        else:
+            alpha = self.alpha_tensor
+
+        # Optimize entropy coefficient, also called
+        # entropy temperature or alpha in the paper
+        if alpha_loss is not None:
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+
         value_net_loss = self.compute_value_net_loss(state_batch_t1, state_batch_t2,
                                                      actions_batch_t1, actions_batch_t2,
-                                                     reward_batch, done_batch, pred_error_batch_t0t1)
+                                                     reward_batch, done_batch, pred_error_batch_t0t1,
+                                                     alpha)
         self.transition_net.optimizer.zero_grad()
 
         self.value_net.optimizer.zero_grad()
@@ -721,7 +693,9 @@ class Agent:
         # Optimize the actor
         self.actor.optimizer.zero_grad()
         # Compute the variational free energy:
-        vfe = self.compute_variational_free_energy(state_batch_t1, pred_error_batch_t0t1)
+        vfe = self.compute_variational_free_energy(state_batch_t1,
+                                                   sampled_actions_t1, sampled_actions_log_prob_t1,
+                                                   pred_error_batch_t0t1, alpha)
         vfe.backward()
         actor_grad = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100000.)
         transition_net_grad = torch.nn.utils.clip_grad_norm_(self.transition_net.parameters(), 100000.)
@@ -738,7 +712,7 @@ class Agent:
     # do the evaluation
     def _eval_agent(self, epoch):
         images = []
-        reward = []
+        reward_array = []
         done = []
         episode_step = 0
 
@@ -750,19 +724,20 @@ class Agent:
             new_observation, reward, _, info = self.env.step(action)
 
             observation = new_observation['observation']
-            reward.append(reward)
+            reward_array.append(reward)
             done.append(info['is_success'])
             episode_step += 1
 
             if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
                 images += [self.env.render(mode='rgb_array')]
 
-        return np.mean(np.asarray(done)), np.mean(np.asarray(reward)), np.asarray(images)
+        return np.mean(np.asarray(done)), np.mean(np.asarray(reward_array)), np.asarray(images)
 
     def train(self):
         self.writer.add_text(self.experiment_name, self.experiment_description)
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
+        self.warmup()
         for epoch in range(self.n_epochs):
             for cycle in range(self.n_cycles):
                 step = self.n_cycles * epoch + cycle
@@ -779,7 +754,7 @@ class Agent:
 
                     for episode_step in range(self._max_episode_steps):
                         input_tensor = self._preprocess_inputs(observation, desired_goal)
-                        action, log_prob = self._select_action(input_tensor)
+                        action = self._select_action(input_tensor)
 
                         episode_data['observation'].append(observation.copy())
                         episode_data['achieved_goal'].append(achieved_goal.copy())
@@ -839,7 +814,7 @@ class Agent:
 
                 # soft update
                 if cycle % self.target_update_interval == 0:
-                    self._soft_update_target_network(self.target_net, self.value_net)
+                    polyak_update(self.value_net.parameters(), self.target_net.parameters(), 0.005)
 
                 success_rate = np.mean(cycle_summary_data['done'])
                 reward = np.mean(cycle_summary_data['reward'])
@@ -858,7 +833,7 @@ class Agent:
             self.val_metrics.update('reward', reward)
 
             if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
-                self.writer.add_video(self.experiment_name + f'_{epoch}', images)
+                imageio.mimsave(self.video_log_path.format(epoch), images)
 
             if self.should_save_model and epoch > 0 and epoch % self.model_save_timer == 0:
                 self.transition_net.save(os.path.join(self.model_path, 'transition_net.pth'))
@@ -955,9 +930,61 @@ class Agent:
     def as_tensor(self, numpy_array):
         return torch.tensor(numpy_array, dtype=torch.float32, device=self.device)
 
+    def warmup(self):
+        for step in range(1):
+            cycle_summary_data = {'done': [], 'reward': []}
+            cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
+
+            for _ in range(self.learning_start):
+                observation, achieved_goal, desired_goal, done, reward = self._reset()
+
+                episode_summary_data = {'done': [], 'reward': []}
+                episode_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
+
+                for episode_step in range(self._max_episode_steps):
+                    input_tensor = self._preprocess_inputs(observation, desired_goal)
+                    action = self._select_action(input_tensor)
+
+                    episode_data['observation'].append(observation.copy())
+                    episode_data['achieved_goal'].append(achieved_goal.copy())
+                    episode_data['desired_goal'].append(desired_goal.copy())
+                    episode_data['action'].append(action.copy())
+
+                    # feed the actions into the environment
+                    new_observation, reward, _, info = self.env.step(action)
+
+                    episode_summary_data['reward'].append(np.mean(reward))
+                    episode_summary_data['done'].append(info['is_success'])
+
+                    observation = new_observation['observation']
+                    achieved_goal = new_observation['achieved_goal']
+
+                cycle_data['observation'].append(np.asarray(episode_data['observation'], dtype=np.float32))
+                cycle_data['achieved_goal'].append(np.asarray(episode_data['achieved_goal'], dtype=np.float32))
+                cycle_data['desired_goal'].append(np.asarray(episode_data['desired_goal'], dtype=np.float32))
+                cycle_data['action'].append(np.asarray(episode_data['action'], dtype=np.float32))
+
+                cycle_summary_data['done'].append(np.mean(episode_summary_data['done']))
+                cycle_summary_data['reward'].append(np.mean(episode_summary_data['reward']))
+
+            cycle_data['observation'] = np.asarray(cycle_data['observation'], dtype=np.float32)
+            cycle_data['achieved_goal'] = np.asarray(cycle_data['achieved_goal'], dtype=np.float32)
+            cycle_data['desired_goal'] = np.asarray(cycle_data['desired_goal'], dtype=np.float32)
+            cycle_data['action'] = np.asarray(cycle_data['action'], dtype=np.float32)
+
+            cycle_summary_data['done'] = np.asarray(cycle_summary_data['done'], dtype=np.float32)
+            cycle_summary_data['reward'] = np.asarray(cycle_summary_data['reward'], dtype=np.float32)
+
+            # store the episodes
+            self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.learning_start)
+            self._update_normalizer(**cycle_data)
+
 
 def make_env(config):
-    env = gym.make(config.env_id, render_mode=config.render_mode)
+    if config.render_mode == 'none':
+        env = gym.make(config.env_id)
+    else:
+        env = gym.make(config.env_id, render_mode=config.render_mode)
     # env = Monitor(env, prepare_path(config.monitor_file, experiment_name=config.experiment_name))
     env.seed(config.seed)
     return env
@@ -985,8 +1012,21 @@ def get_env_parameters(env):
     return observation_dim, goal_dim, action_dim, max_action_value
 
 
+def create_dirs(dirs):
+    try:
+        for dir_ in dirs:
+            if not os.path.exists(dir_):
+                os.makedirs(dir_)
+        return 0
+    except Exception as err:
+        print("Creating directories error: {0}".format(err))
+        exit(-1)
+
+
 def prepare_path(path, **args):
-    return os.path.join(ROOT_DIR_PATH, path.format(**args))
+    res = os.path.join(ROOT_DIR_PATH, path.format(**args))
+    create_dirs([res])
+    return res
 
 
 def set_random_seed(seed: int, device: str = 'cpu') -> None:

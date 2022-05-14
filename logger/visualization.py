@@ -44,7 +44,7 @@ class TensorboardWriter():
             self.timer = datetime.now()
         else:
             duration = datetime.now() - self.timer
-            self.add_scalar('steps_per_sec', 1 / duration.total_seconds())
+            # self.add_scalar('steps_per_sec', 1 / duration.total_seconds())
             self.timer = datetime.now()
 
     def __getattr__(self, name):
@@ -56,6 +56,8 @@ class TensorboardWriter():
         """
         if name in self.tb_writer_ftns:
             add_data = getattr(self.writer, name, None)
+            if name is 'add_hparams':
+                return add_data
 
             def wrapper(tag, data, *args, **kwargs):
                 if add_data is not None:
