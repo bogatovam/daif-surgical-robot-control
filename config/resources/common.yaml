@@ -10,13 +10,14 @@ seed: 42
 
 hparams:
   n_epochs: 50
-  n_cycles: 50
-  n_batches: 10
-  n_episodes: 10
+  steps_per_epoch: 50
+  n_training_iterations: 10
+  n_rollout_episodes: 10
+  n_warmap_episodes: 20
 
 should_save_model: true
 model_path: models\{experiment_name}
-model_save_timer: 3
+model_save_timer: 1
 
 
 should_save_episode_video: true

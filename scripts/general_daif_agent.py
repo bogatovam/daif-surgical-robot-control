@@ -4,7 +4,7 @@ import os.path
 import random
 import sys
 from abc import abstractmethod, ABC
-from typing import Tuple, Optional
+from typing import Tuple, Optional, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -391,18 +391,40 @@ class Actor(BasePolicy):
 
         self.optimizer = optim.Adam(self.parameters(), lr=lr)
 
+        self.observation_space = observation_space
+        self.action_space = action_space
+        self.input_size = input_size
+        self.net_arch = net_arch
+        self.weight_decay = weight_decay
+        self.lr = lr
+        self.activation_fn = activation_fn
+        self.use_sde = use_sde
+        self.log_std_init = log_std_init
+        self.full_std = full_std
+        self.sde_net_arch = sde_net_arch
+        self.use_expln = use_expln
+        self.clip_mean = clip_mean
+        self.normalize_images = normalize_images
+
     def _get_constructor_parameters(self):
         data = super()._get_constructor_parameters()
 
         data.update(
             dict(
+                observation_space=self.observation_space,
+                action_space=self.action_space,
+                input_size=self.input_size,
                 net_arch=self.net_arch,
+                weight_decay=self.weight_decay,
+                lr=self.lr,
                 activation_fn=self.activation_fn,
                 use_sde=self.use_sde,
                 log_std_init=self.log_std_init,
                 full_std=self.full_std,
+                sde_net_arch=self.sde_net_arch,
                 use_expln=self.use_expln,
                 clip_mean=self.clip_mean,
+                normalize_images=self.normalize_images,
             )
         )
         return data
@@ -451,11 +473,89 @@ class MLP(BaseModel):
         self.device = device
         self.to(self.device)
 
+        self.input_size = input_size
+        self.layer_sizes = layer_sizes
+        self.output_size = output_size
+        self.lr = lr
+        self.output_activation = output_activation
+        self.activation = activation
+        self.weight_decay = weight_decay
+
     def forward(self, inp):
         x = inp
         for layer in self.layers:
             x = layer(x)
         return x
+
+    def _get_constructor_parameters(self):
+        data = super()._get_constructor_parameters()
+
+        data.update(
+            dict(
+                input_size=self.input_size,
+                layer_sizes=self.layer_sizes,
+                output_size=self.output_size,
+                lr=self.lr,
+                output_activation=self.output_activation,
+                activation=self.activation,
+                weight_decay=self.weight_decay,
+                device=self.device,
+            )
+        )
+        return data
+
+
+class EpisodeData(NamedTuple):
+    observation: list = []
+    achieved_goal: list = []
+    desired_goal: list = []
+    action: list = []
+
+    def add(self, observation, achieved_goal, desired_goal, action):
+        self.observation.append(observation)
+        self.achieved_goal.append(achieved_goal)
+        self.desired_goal.append(desired_goal)
+        self.action.append(action)
+
+    def as_numpy_arrays(self):
+        return np.asarray(self.observation), np.asarray(self.achieved_goal), \
+               np.asarray(self.desired_goal), np.asarray(self.action)
+
+    @classmethod
+    def as_dict_of_numpy_arrays(cls, collected_step_episodes):
+        data = EpisodeData()
+
+        for elem in collected_step_episodes:
+            data.add(**elem.as_numpy_arrays())
+
+        data_as_dict = data._asdict()
+        for key, value in data._asdict().items():
+            data_as_dict[key] = np.asarray(value)
+        return data_as_dict
+
+
+class EpisodeSummary(NamedTuple):
+    done: list = []
+    reward: list = []
+
+    def add(self, reward, done):
+        self.done.append(done)
+        self.reward.append(reward)
+
+    def calc_summary(self):
+        return np.mean(self.reward), np.mean(self.done)
+
+    @classmethod
+    def as_dict_of_values(cls, collected_step_summary):
+        data = EpisodeSummary()
+
+        for elem in collected_step_summary:
+            data.add(**elem.calc_summary())
+
+        data_as_dict = data._asdict()
+        for key, value in data._asdict().items():
+            data_as_dict[key] = np.mean(data)
+        return data_as_dict
 
 
 class Agent:
@@ -537,6 +637,9 @@ class Agent:
         # The entropy coefficient or entropy can be learned automatically
         # see Automating Entropy Adjustment for Maximum Entropy RL section
         # of https://arxiv.org/abs/1812.05905
+        self.log_alpha = None
+        self.alpha_optimizer = None
+        self.alpha_tensor = None
         if isinstance(self.alpha, str) and self.alpha.startswith("auto"):
             init_value = 1.0
             if "_" in self.alpha:
@@ -568,8 +671,8 @@ class Agent:
 
         self.train_metrics = MetricTracker('vfe', 'efe_mse_loss', 'success_rate', 'reward',
                                            'transition_net_grad', 'actor_grad_acc', 'value_net_grad',
-                                           'sde_std', 'alpha', 'predicted_log_prob_t1', 'min_qf_pi', 'next_q_values',
-                                           'next_log_prob', writer=self.writer)
+                                           'sde_std',
+                                           writer=self.writer)
 
         self.val_metrics = MetricTracker('success_rate', 'reward', writer=self.writer)
 
@@ -582,8 +685,24 @@ class Agent:
 
         with open(os.path.join(self.model_path, "config.yaml"), 'w+') as file:
             OmegaConf.save(config, file)
-
         # self.writer.add_hparams(config_as_dict, {}, run_name=config.experiment_name)
+
+    def restore(self):
+        self.transition_net.load(os.path.join(self.model_path, 'transition_net.pth'), self.device)
+        self.actor.load(os.path.join(self.model_path, 'actor.pth'), self.device)
+        self.value_net.load(os.path.join(self.model_path, 'value_net.pth'), self.device)
+
+        if self.log_alpha is not None:
+            saved_log_alpha = torch.load(os.path.join(self.model_path, 'log_alpha.pt'))
+            self.log_alpha = saved_log_alpha
+
+        if self.alpha_optimizer is not None:
+            saved_alpha_optimizer = torch.load(os.path.join(self.model_path, 'alpha_optimizer.pt'))
+            self.alpha_optimizer.load_state_dict(state_dict=saved_alpha_optimizer["state_dict"])
+
+        if self.alpha_tensor is not None:
+            saved_alpha_tensor = torch.load(os.path.join(self.model_path, 'alpha_tensor.pt'))
+            self.alpha_tensor = saved_alpha_tensor
 
     def get_mini_batches(self):
         # Retrieve transition data in mini batches
@@ -632,8 +751,7 @@ class Agent:
 
             # Determine the batch of bootstrapped estimates of the EFEs:
             expected_free_energy_estimate_batch = (
-                    reward_batch.reshape(-1, 1) + -pred_error_batch_t0t1 +
-                    (1 - done_batch.reshape(-1, 1)) * self.beta * weighted_targets)
+                    reward_batch + -pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
 
         # Determine the Expected free energy at time t1 according to the value network:
         value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
@@ -653,7 +771,6 @@ class Agent:
         return torch.mean(vfe_batch)
 
     def _update_network(self):
-        # We need to sample because `log_std` may have changed between two gradient steps
         if self.use_sde:
             self.actor.reset_noise()
 
@@ -661,10 +778,11 @@ class Agent:
         (state_batch_t0, state_batch_t1, state_batch_t2,
          actions_batch_t0, actions_batch_t1, actions_batch_t2,
          reward_batch, done_batch, pred_error_batch_t0t1) = self.get_mini_batches()
+        # Compute the value network loss:
 
         # Action by the current actor for the sampled state
-        actions_pi, log_prob = self.actor.action_log_prob(state_batch_t1)
-        log_prob = log_prob.reshape(-1, 1)
+        sampled_actions_t1, sampled_actions_log_prob_t1 = self.actor.action_log_prob(state_batch_t1)
+        sampled_actions_log_prob_t1 = sampled_actions_log_prob_t1.reshape(-1, 1)
 
         alpha_loss = None
         if self.alpha_optimizer is not None:
@@ -672,7 +790,7 @@ class Agent:
             # so we don't change it with other losses
             # see https://github.com/rail-berkeley/softlearning/issues/60
             alpha = torch.exp(self.log_alpha.detach())
-            alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+            alpha_loss = -(self.log_alpha * (sampled_actions_log_prob_t1 + self.target_entropy).detach()).mean()
         else:
             alpha = self.alpha_tensor
 
@@ -683,53 +801,35 @@ class Agent:
             alpha_loss.backward()
             self.alpha_optimizer.step()
 
-        with torch.no_grad():
-            # Select action according to policy
-            next_actions, next_log_prob = self.actor.action_log_prob(state_batch_t2)
-            # Compute the next Q values: min over all critics targets
-            next_q_values = self.target_net(torch.cat([state_batch_t2, next_actions], dim=1))
-            # add entropy term
-            next_q_values = next_q_values - alpha * next_log_prob.reshape(-1, 1)
-            # td error + entropy term
-            target_q_values = reward_batch.reshape(-1, 1) + (
-                    1.0 - done_batch.reshape(-1, 1)) * self.gamma * next_q_values
+        value_net_loss = self.compute_value_net_loss(state_batch_t1, state_batch_t2,
+                                                     actions_batch_t1, actions_batch_t2,
+                                                     reward_batch, done_batch, pred_error_batch_t0t1,
+                                                     alpha)
+        self.transition_net.optimizer.zero_grad()
 
-        # Get current Q-values estimates for each critic network
-        # using action from the replay buffer
-
-        current_q_values = self.value_net(torch.cat([state_batch_t1, actions_batch_t1], dim=1))
-
-        # Compute critic loss
-        critic_loss = F.mse_loss(current_q_values, target_q_values)
-
-        # Optimize the critic
         self.value_net.optimizer.zero_grad()
-        critic_loss.backward()
+        value_net_loss.backward()
+        value_net_grad = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 100000.)
         self.value_net.optimizer.step()
-
-        # Compute actor loss
-        # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
-        # Mean over all critic networks
-        min_qf_pi = self.value_net(torch.cat([state_batch_t1, actions_pi], dim=1))
-        actor_loss = (alpha * log_prob - min_qf_pi).mean()
 
         # Optimize the actor
         self.actor.optimizer.zero_grad()
-        actor_loss.backward()
+        # Compute the variational free energy:
+        vfe = self.compute_variational_free_energy(state_batch_t1,
+                                                   sampled_actions_t1, sampled_actions_log_prob_t1,
+                                                   pred_error_batch_t0t1, alpha)
+        vfe.backward()
+        actor_grad = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100000.)
+        transition_net_grad = torch.nn.utils.clip_grad_norm_(self.transition_net.parameters(), 100000.)
         self.actor.optimizer.step()
+        self.transition_net.optimizer.step()
 
-        polyak_update(self.value_net.parameters(), self.target_net.parameters(), 0.005)
+        return vfe.item(), value_net_loss.item(), transition_net_grad.item(), actor_grad.item(), value_net_grad.item()
 
-        metrics = dict(
-            vfe=actor_loss.item(),
-            efe_mse_loss=critic_loss.item(),
-            alpha=alpha.item().detach().item(),
-            predicted_log_prob_t1=log_prob.mean().detach().item(),
-            min_qf_pi=min_qf_pi.mean().detach().item(),
-            next_q_values=next_q_values.mean().detach().item(),
-            next_log_prob=next_log_prob.mean().detach().item(),
-        )
-        return metrics
+    # soft update
+    def _soft_update_target_network(self, target, source):
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_((1 - self.polyak) * param.data + self.polyak * target_param.data)
 
     # do the evaluation
     def _eval_agent(self, epoch):
@@ -765,52 +865,35 @@ class Agent:
                 step = self.steps_per_epoch * epoch + cycle
                 self.writer.set_step(step)
 
-                cycle_summary_data = {'done': [], 'reward': []}
-                cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
-
+                collected_step_summary = []
+                collected_step_episodes = []
                 for _ in range(self.n_rollout_episodes):
-                    observation, achieved_goal, desired_goal, done, reward = self._reset()
 
-                    episode_summary_data = {'done': [], 'reward': []}
-                    episode_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
+                    episode_data, episode_summary = EpisodeData(), EpisodeSummary()
+                    observation, achieved_goal, desired_goal, done, reward = self._reset()
 
                     for episode_step in range(self._max_episode_steps):
                         input_tensor = self._preprocess_inputs(observation, desired_goal)
                         action = self._select_action(input_tensor)
 
-                        episode_data['observation'].append(observation.copy())
-                        episode_data['achieved_goal'].append(achieved_goal.copy())
-                        episode_data['desired_goal'].append(desired_goal.copy())
-                        episode_data['action'].append(action.copy())
-
                         # feed the actions into the environment
                         new_observation, reward, _, info = self.env.step(action)
 
-                        episode_summary_data['reward'].append(np.mean(reward))
-                        episode_summary_data['done'].append(info['is_success'])
+                        episode_data.add(observation.copy(), achieved_goal.copy(), desired_goal.copy(), action.copy())
+                        episode_summary.add(np.mean(reward), info['is_success'])
 
                         observation = new_observation['observation']
                         achieved_goal = new_observation['achieved_goal']
 
-                    cycle_data['observation'].append(np.asarray(episode_data['observation'], dtype=np.float32))
-                    cycle_data['achieved_goal'].append(np.asarray(episode_data['achieved_goal'], dtype=np.float32))
-                    cycle_data['desired_goal'].append(np.asarray(episode_data['desired_goal'], dtype=np.float32))
-                    cycle_data['action'].append(np.asarray(episode_data['action'], dtype=np.float32))
+                    collected_step_episodes.append(episode_data)
+                    collected_step_summary.append(episode_summary)
 
-                    cycle_summary_data['done'].append(np.mean(episode_summary_data['done']))
-                    cycle_summary_data['reward'].append(np.mean(episode_summary_data['reward']))
-
-                cycle_data['observation'] = np.asarray(cycle_data['observation'], dtype=np.float32)
-                cycle_data['achieved_goal'] = np.asarray(cycle_data['achieved_goal'], dtype=np.float32)
-                cycle_data['desired_goal'] = np.asarray(cycle_data['desired_goal'], dtype=np.float32)
-                cycle_data['action'] = np.asarray(cycle_data['action'], dtype=np.float32)
-
-                cycle_summary_data['done'] = np.asarray(cycle_summary_data['done'], dtype=np.float32)
-                cycle_summary_data['reward'] = np.asarray(cycle_summary_data['reward'], dtype=np.float32)
+                collected_step_episodes = EpisodeData.as_dict_of_numpy_arrays(collected_step_episodes)
+                collected_step_summary = EpisodeSummary.as_dict_of_values(collected_step_summary)
 
                 # store the episodes
-                self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_rollout_episodes)
-                self._update_normalizer(**cycle_data)
+                self.buffer.store_episode(**collected_step_episodes, n_episodes_to_store=self.n_rollout_episodes)
+                self._update_normalizer(**collected_step_episodes)
 
                 train_iteration_metrics = []
                 for _ in range(self.n_training_iterations):
@@ -831,8 +914,8 @@ class Agent:
                 if cycle % self.target_update_interval == 0:
                     polyak_update(self.value_net.parameters(), self.target_net.parameters(), 0.005)
 
-                success_rate = np.mean(cycle_summary_data['done'])
-                reward = np.mean(cycle_summary_data['reward'])
+                success_rate = collected_step_summary['done']
+                reward = collected_step_summary['reward']
 
                 self.train_metrics.update('success_rate', success_rate)
                 self.train_metrics.update('reward', reward)
@@ -855,12 +938,32 @@ class Agent:
                 self.actor.save(os.path.join(self.model_path, 'actor.pth'))
                 self.value_net.save(os.path.join(self.model_path, 'value_net.pth'))
 
+                if self.log_alpha is not None:
+                    torch.save(self.log_alpha, os.path.join(self.model_path, 'log_alpha.pt'))
+
+                if self.alpha_optimizer is not None:
+                    torch.save({"state_dict": self.alpha_optimizer.state_dict()},
+                               os.path.join(self.model_path, 'alpha_optimizer.pt'))
+
+                if self.alpha_tensor is not None:
+                    torch.save(self.alpha_tensor, os.path.join(self.model_path, 'alpha_tensor.pt'))
+
         self.env.close()
 
         if self.should_save_model:
             self.transition_net.save(os.path.join(self.final_model_path, 'transition_net.pth'))
             self.actor.save(os.path.join(self.final_model_path, 'actor.pth'))
             self.value_net.save(os.path.join(self.final_model_path, 'value_net.pth'))
+
+            if self.log_alpha is not None:
+                torch.save(self.log_alpha, os.path.join(self.final_model_path, 'log_alpha.pt'))
+
+            if self.alpha_optimizer is not None:
+                torch.save({"state_dict": self.alpha_optimizer.state_dict()},
+                           os.path.join(self.final_model_path, 'alpha_optimizer.pt'))
+
+            if self.alpha_tensor is not None:
+                torch.save(self.alpha_tensor, os.path.join(self.final_model_path, 'alpha_tensor.pt'))
 
         # Print and keep a (.txt) record of stuff
         print("Training finished at {}".format(datetime.now()))
@@ -1071,4 +1174,5 @@ def train_agent_according_config(config):
 
 
 if __name__ == '__main__':
+    # v14-remake working with this version
     train_agent_according_config(get_config(env_id='NeedleReach-v0', device='cpu'))

@@ -517,12 +517,12 @@ class Agent:
         self.polyak = int(config.hparams.polyak)
 
         self.use_sde = int(config.hparams.use_sde)
-        self.learning_start = int(config.hparams.learning_start)
+        self.n_warmap_episodes = int(config.hparams.n_warmap_episodes)
 
         self.n_epochs = int(config.hparams.n_epochs)
-        self.n_cycles = int(config.hparams.n_cycles)
-        self.n_episodes = int(config.hparams.n_episodes)
-        self.n_batches = int(config.hparams.n_batches)
+        self.steps_per_epoch = int(config.hparams.steps_per_epoch)
+        self.n_rollout_episodes = int(config.hparams.n_rollout_episodes)
+        self.n_training_iterations = int(config.hparams.n_training_iterations)
         self._max_episode_steps = env._max_episode_steps
 
         self.batch_size = int(config.hparams.batch_size)
@@ -808,14 +808,14 @@ class Agent:
 
         self.warmup()
         for epoch in range(self.n_epochs):
-            for cycle in range(self.n_cycles):
-                step = self.n_cycles * epoch + cycle
+            for cycle in range(self.steps_per_epoch):
+                step = self.steps_per_epoch * epoch + cycle
                 self.writer.set_step(step)
 
                 cycle_summary_data = {'done': [], 'reward': []}
                 cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
 
-                for _ in range(self.n_episodes):
+                for _ in range(self.n_rollout_episodes):
                     observation, achieved_goal, desired_goal, done, reward = self._reset()
 
                     episode_summary_data = {'done': [], 'reward': []}
@@ -856,13 +856,13 @@ class Agent:
                 cycle_summary_data['reward'] = np.asarray(cycle_summary_data['reward'], dtype=np.float32)
 
                 # store the episodes
-                self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_episodes)
+                self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_rollout_episodes)
                 self._update_normalizer(**cycle_data)
 
                 vfe = []
                 value_net_loss = []
                 (transition_net_grad_acc, actor_grad_acc, value_net_grad_acc) = 0, 0, 0
-                for _ in range(self.n_batches):
+                for _ in range(self.n_training_iterations):
                     # train the network
                     (vfe_item, value_net_loss_item, transition_net_grad, actor_grad,
                      value_net_grad) = self._update_network()
@@ -874,9 +874,9 @@ class Agent:
 
                 self.train_metrics.update('vfe', np.mean(vfe))
                 self.train_metrics.update('efe_mse_loss', np.mean(value_net_loss))
-                self.train_metrics.update('transition_net_grad', transition_net_grad_acc / self.n_batches)
-                self.train_metrics.update('actor_grad_acc', actor_grad_acc / self.n_batches)
-                self.train_metrics.update('value_net_grad', value_net_grad_acc / self.n_batches)
+                self.train_metrics.update('transition_net_grad', transition_net_grad_acc / self.n_training_iterations)
+                self.train_metrics.update('actor_grad_acc', actor_grad_acc / self.n_training_iterations)
+                self.train_metrics.update('value_net_grad', value_net_grad_acc / self.n_training_iterations)
 
                 if self.use_sde:
                     self.train_metrics.update('sde_std', (self.actor.get_std()).mean().item())
@@ -1024,7 +1024,7 @@ class Agent:
             cycle_summary_data = {'done': [], 'reward': []}
             cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
 
-            for _ in range(self.learning_start):
+            for _ in range(self.n_warmap_episodes):
                 observation, achieved_goal, desired_goal, done, reward = self._reset()
 
                 episode_summary_data = {'done': [], 'reward': []}
@@ -1065,7 +1065,7 @@ class Agent:
             cycle_summary_data['reward'] = np.asarray(cycle_summary_data['reward'], dtype=np.float32)
 
             # store the episodes
-            self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.learning_start)
+            self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_warmap_episodes)
             self._update_normalizer(**cycle_data)
 
 

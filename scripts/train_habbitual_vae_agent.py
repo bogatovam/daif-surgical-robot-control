@@ -673,9 +673,9 @@ class Agent:
         self.polyak = int(config.polyak)
 
         self.n_epochs = int(config.n_epochs)
-        self.n_cycles = int(config.n_cycles)
-        self.n_episodes = int(config.n_episodes)
-        self.n_batches = int(config.n_batches)
+        self.steps_per_epoch = int(config.steps_per_epoch)
+        self.n_rollout_episodes = int(config.n_rollout_episodes)
+        self.n_training_iterations = int(config.n_training_iterations)
         self._max_episode_steps = int(config.max_episode_steps)
 
         self.batch_size = int(config.batch_size)
@@ -923,15 +923,15 @@ class Agent:
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
         for epoch in range(self.n_epochs):
-            for step in range(self.n_cycles):
-                self.writer.set_step(self.n_cycles * epoch + step)
+            for step in range(self.steps_per_epoch):
+                self.writer.set_step(self.steps_per_epoch * epoch + step)
 
                 cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [],
                               'action': [], 'log_prob': []}
 
                 cycle_summary_data = {'done': [], 'reward': []}
 
-                for _ in range(self.n_episodes):
+                for _ in range(self.n_rollout_episodes):
                     observation, achieved_goal, desired_goal, done, reward = self._reset()
 
                     episode_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [],
@@ -978,13 +978,13 @@ class Agent:
                 cycle_summary_data['reward'] = np.asarray(cycle_summary_data['reward'], dtype=np.float32)
 
                 # store the episodes
-                self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_episodes)
+                self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_rollout_episodes)
                 self._update_normalizer(**cycle_data)
 
                 vfe = []
                 value_net_loss = []
                 (transition_net_grad_acc, actor_grad_acc, value_net_grad_acc) = 0, 0, 0
-                for _ in range(self.n_batches):
+                for _ in range(self.n_training_iterations):
                     # train the network
                     (vfe_item, value_net_loss_item, transition_net_grad, actor_grad,
                      value_net_grad) = self._update_network()
@@ -996,9 +996,9 @@ class Agent:
 
                 self.metrics.update('vfe', np.mean(vfe))
                 self.metrics.update('efe_mse_loss', np.mean(value_net_loss))
-                self.metrics.update('transition_net_grad', transition_net_grad_acc / self.n_batches)
-                self.metrics.update('actor_grad_acc', actor_grad_acc / self.n_batches)
-                self.metrics.update('value_net_grad', value_net_grad_acc / self.n_batches)
+                self.metrics.update('transition_net_grad', transition_net_grad_acc / self.n_training_iterations)
+                self.metrics.update('actor_grad_acc', actor_grad_acc / self.n_training_iterations)
+                self.metrics.update('value_net_grad', value_net_grad_acc / self.n_training_iterations)
 
                 # soft update
                 if step % self.target_update_interval == 0:

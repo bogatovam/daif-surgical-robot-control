@@ -24,4 +24,28 @@ hparams:
   alpha: auto
   gamma: 1.00
   beta: 0.99
-  learning_start: 20
+
+#  available values list:
+#  sac_maximize
+#  sac_minimise
+#  sac_minimize_entropy
+#  adapted_a2c
+  efe_approximation_approach: sac_maximize
+
+#  available values list:
+#  SquashedDiagGaussianDistribution
+#  StateDependentNoiseDistribution
+#  DiagGaussianDistribution
+  agent_action_distribution: SquashedDiagGaussianDistribution
+
+#  available values list:
+#  none - to test its impact
+#  GRU
+#  LSTM
+  transition_network_type: none
+
+#  available values list:
+# Disentangled Beta-VAE
+# LogCosh
+# original
+  vae_type: none
