@@ -1,5 +1,8 @@
-experiment_name: efe-as-sac-v14
-experiment_description: "learn alpha, hparams from baseline implementation"
+experiment_name: efe-as-sac-v15
+experiment_description: "baseline alg"
+
+#experiment_name: efe-as-sac-v15
+#experiment_description: "use true alg"
 
 monitor_file: logs\{experiment_name}\monitor.csv
 tb_log_folder: logs\tensorboard\{experiment_name}
@@ -8,8 +11,8 @@ seed: 42
 hparams:
   n_epochs: 50
   n_cycles: 50
-  n_batches: 5
-  n_episodes: 5
+  n_batches: 10
+  n_episodes: 10
 
 should_save_model: true
 model_path: models\{experiment_name}

@@ -10,14 +10,14 @@ hparams:
 
 #  Networks
   use_sde: False
-  actor_layers:  [128, 128]
-  transition_net_layers: [128, 128]
-  value_net_layers: [128, 128]
+  actor_layers:  [128, 256, 128]
+  transition_net_layers: [128, 256, 128]
+  value_net_layers: [128, 256, 128]
 
   actor_lr: 0.0003
   transition_net_lr: 0.0003
   value_net_lr: 0.0003
-  alpha_lr: 1e-4
+  alpha_lr: 0.0003
 
   noise_eps: 0.2
   random_eps: 0.3
