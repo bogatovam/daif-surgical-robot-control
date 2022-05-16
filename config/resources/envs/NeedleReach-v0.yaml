@@ -1,7 +1,5 @@
 env_id: "NeedleReach-v0"
 
-print_timer: 100
-
 hparams:
   polyak: 0.95
 # HER
@@ -9,7 +7,6 @@ hparams:
   replay_k: 4
 
 #  Networks
-  use_sde: False
   actor_layers:  [128, 256, 128]
   transition_net_layers: [128, 256, 128]
   value_net_layers: [128, 256, 128]
@@ -19,8 +16,6 @@ hparams:
   value_net_lr: 0.0003
   alpha_lr: 0.0003
 
-  noise_eps: 0.2
-  random_eps: 0.3
   alpha: auto
   gamma: 1.00
   beta: 0.99
@@ -29,23 +24,23 @@ hparams:
 #  sac_maximize
 #  sac_minimise
 #  sac_minimize_entropy
-#  adapted_a2c
+#  adapted_daif
   efe_approximation_approach: sac_maximize
 
 #  available values list:
 #  SquashedDiagGaussianDistribution
 #  StateDependentNoiseDistribution
-#  DiagGaussianDistribution
-  agent_action_distribution: SquashedDiagGaussianDistribution
+  actor_action_distribution: SquashedDiagGaussianDistribution
 
 #  available values list:
-#  none - to test its impact
-#  GRU
-#  LSTM
-  transition_network_type: none
+#  mlp
+#  gru
+#  lstm
+  transition_network_type: lstm
 
 #  available values list:
 # Disentangled Beta-VAE
 # LogCosh
 # original
   vae_type: none
+  observations_seq_len: 3 # default 3

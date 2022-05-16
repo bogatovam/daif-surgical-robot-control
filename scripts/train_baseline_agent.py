@@ -323,10 +323,6 @@ class Agent:
 
         self.gamma = float(config.gamma)  # A precision parameter
         self.beta = float(config.beta)  # The discount rate
-        self.noise_eps = float(config.noise_eps)  # The discount rate
-        self.random_eps = float(config.random_eps)  # The discount rate
-
-        self.print_timer = int(config.print_timer)
 
         self.should_save_model = interpret_boolean(config.should_save_model)
         self.model_path = prepare_path(config.model_path, experiment_name=config.experiment_name)
@@ -720,15 +716,6 @@ class Agent:
             # Determine the action distribution given the current observation:
             mu, log_variance = self.prediction(input_tensor)
             return self._infer_action_using_reparameterization(mu, log_variance).detach().cpu().numpy().flatten()
-            # # add the gaussian
-            # if random:
-            #     action += self.noise_eps * self.action_max * np.random.randn(*action.shape)
-            #     action = np.clip(action, -self.action_max, self.action_max)
-
-            # # random actions...
-            # random_actions = np.random.uniform(low=-self.action_max, high=self.action_max, size=self.action_dim)
-            # # choose if use the random actions
-            # action += np.random.binomial(1, self.random_eps, 1)[0] * (random_actions - action)
 
     def _sample_actions_with_probs(self, input_tensor, n_samples):
         # input_tensor.shape = (batch_size, obs_dim + desired_goal)

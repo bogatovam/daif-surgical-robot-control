@@ -685,11 +685,6 @@ class Agent:
 
         self.gamma = float(config.gamma)  # A precision parameter
         self.beta = float(config.beta)  # The discount rate
-        self.noise_eps = float(config.noise_eps)  # The discount rate
-        self.random_eps = float(config.random_eps)  # The discount rate
-        self.random_eps = float(config.random_eps)  # The discount rate
-
-        self.print_timer = int(config.print_timer)
 
         self.should_save_model = interpret_boolean(config.should_save_model)
         self.model_path = prepare_path(config.model_path, experiment_name=config.experiment_name)

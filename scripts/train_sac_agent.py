@@ -617,42 +617,8 @@ class Agent:
                 actions_batch_t0, actions_batch_t1, actions_batch_t2,
                 reward_batch, done_batch, pred_error_batch_t0t1)
 
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1, actions_batch_t2,
-                               reward_batch, done_batch, pred_error_batch_t0t1, alpha):
-
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_batch_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 - alpha * log_prob_t2.reshape(-1, 1)
-
-            # Determine the batch of bootstrapped estimates of the EFEs:
-            expected_free_energy_estimate_batch = (
-                    reward_batch.reshape(-1, 1) + -pred_error_batch_t0t1 +
-                    (1 - done_batch.reshape(-1, 1)) * self.beta * weighted_targets)
-
-        # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 - expected_free_energy_t1
-        return torch.mean(vfe_batch)
-
     def _update_network(self):
+        # stable-baseline-3 implementation
         # We need to sample because `log_std` may have changed between two gradient steps
         if self.use_sde:
             self.actor.reset_noise()
@@ -891,22 +857,6 @@ class Agent:
         with torch.no_grad():
             action = self.actor.predict(input_tensor)
             return action.cpu().numpy().flatten()
-
-    def _sample_actions_with_probs(self, input_tensor, n_samples):
-        # input_tensor.shape = (batch_size, obs_dim + desired_goal)
-        # Determine the action distribution given the current observation:
-        mu, log_variance = self.prediction(input_tensor)
-        # mu.shape = (batch_size, action_dim)
-
-        r_mu = mu.unsqueeze(1).repeat(1, n_samples, 1)
-        r_log_variance = log_variance.unsqueeze(1).repeat(1, n_samples, 1)
-        # r_mu.shape = (batch_size, n_samples, action_dim)
-
-        actions = self._infer_action_using_reparameterization(r_mu, r_log_variance).detach()
-        # actions.shape = (batch_size, n_samples, action_dim)
-        probs = torch.exp((self._log_prob(actions, r_mu, self._variance2std(r_log_variance))))
-        # actions = self.a_norm.normalize(actions)
-        return mu, log_variance, actions, probs
 
     def _preprocess_inputs(self, observation, goal):
         observation = self.o_norm.normalize(observation)

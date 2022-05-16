@@ -160,17 +160,22 @@ class HERSampler:
         # her idx
         her_indexes = np.where(np.random.uniform(size=batch_size) < self.future_p)
 
+        # Sample 'future' timestamps for each 't_samples'
+        future_offset = np.random.uniform(size=batch_size) * (trajectory_length - 3 - t_samples)
+        future_offset = future_offset.astype(int)
+        future_t = (t_samples + future_offset)[her_indexes]
+
         # previous
         t0 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
-                                   episode_ids, t_samples, her_indexes,
+                                   episode_ids, t_samples, her_indexes, future_t,
                                    batch_size=batch_size, time=0)
         # current
         t1 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
-                                   episode_ids, t_samples, her_indexes,
+                                   episode_ids, t_samples, her_indexes, future_t,
                                    batch_size=batch_size, time=1)
         # next
         t2 = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
-                                   episode_ids, t_samples, her_indexes,
+                                   episode_ids, t_samples, her_indexes, future_t,
                                    batch_size=batch_size, time=2)
 
         (_, achieved_goal_batch_t1, desired_goal_batch_t1, _) = t1
@@ -188,9 +193,7 @@ class HERSampler:
         return t0, t1, t2, reward_batch, done_batch
 
     def _sample_for_time(self, observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
-                         episode_idxs, t_samples, her_indexes, batch_size, time):
-        # Trajectory length
-        trajectory_length = actions_buffer.shape[1] - 3
+                         episode_idxs, t_samples, her_indexes, future_t, batch_size, time):
 
         observation_batch = observation_buffer[:, time:, :][episode_idxs, t_samples].copy()
         achieved_goal_batch = achieved_goal_buffer[:, time:, :][episode_idxs, t_samples].copy()
@@ -202,11 +205,6 @@ class HERSampler:
         achieved_goal_batch = achieved_goal_batch.reshape(batch_size, *achieved_goal_batch.shape[1:])
         desired_goal_batch = desired_goal_batch.reshape(batch_size, *desired_goal_batch.shape[1:])
         actions_batch = actions_batch.reshape(batch_size, *actions_batch.shape[1:])
-
-        # Sample 'future' timestamps for each 't_samples'
-        future_offset = np.random.uniform(size=batch_size) * (trajectory_length - t_samples)
-        future_offset = future_offset.astype(int)
-        future_t = (t_samples + future_offset)[her_indexes]
 
         # Get the achieved_goal at the 'future' timestamps
         next_achieved_goal = achieved_goal_buffer[:, time:, :][episode_idxs[her_indexes], future_t]
@@ -516,10 +514,11 @@ class Agent:
 
         self.polyak = int(config.hparams.polyak)
 
-        self.use_sde = int(config.hparams.use_sde)
+        self.use_sde = False
         self.n_warmap_episodes = int(config.hparams.n_warmap_episodes)
 
         self.n_epochs = int(config.hparams.n_epochs)
+        self.current_epoch = 0
         self.steps_per_epoch = int(config.hparams.steps_per_epoch)
         self.n_rollout_episodes = int(config.hparams.n_rollout_episodes)
         self.n_training_iterations = int(config.hparams.n_training_iterations)
@@ -534,9 +533,9 @@ class Agent:
 
         self.should_save_model = interpret_boolean(config.should_save_model)
         self.model_path = prepare_path(config.model_path, experiment_name=config.experiment_name)
+
         self.video_log_path = os.path.join(
             prepare_path(config.video_log_folder, experiment_name=config.experiment_name), "epoch-{}.gif")
-        self.final_model_path = os.path.join(self.model_path, "final")
         self.model_save_timer = int(config.model_save_timer)
 
         self.should_save_episode_video = interpret_boolean(config.should_save_episode_video)
@@ -552,7 +551,7 @@ class Agent:
         self.actor = Actor(env.observation_space, env.action_space,
                            self.state_size,
                            OmegaConf.to_object(config.hparams.actor_layers),
-                           use_sde=config.hparams.use_sde,
+                           use_sde=self.use_sde,
                            lr=config.hparams.actor_lr)
 
         self.transition_net = MLP(self.state_size + self.action_dim,
@@ -584,9 +583,9 @@ class Agent:
         # The entropy coefficient or entropy can be learned automatically
         # see Automating Entropy Adjustment for Maximum Entropy RL section
         # of https://arxiv.org/abs/1812.05905
-        self.log_alpha =  None
-        self.alpha_optimizer =  None
-        self.alpha_tensor =  None
+        self.log_alpha = None
+        self.alpha_optimizer = None
+        self.alpha_tensor = None
         if isinstance(self.alpha, str) and self.alpha.startswith("auto"):
             init_value = 1.0
             if "_" in self.alpha:
@@ -635,9 +634,11 @@ class Agent:
         # self.writer.add_hparams(config_as_dict, {}, run_name=config.experiment_name)
 
     def restore(self):
-        self.transition_net.load(os.path.join(self.model_path, 'transition_net.pth'), self.device)
-        self.actor.load(os.path.join(self.model_path, 'actor.pth'), self.device)
-        self.value_net.load(os.path.join(self.model_path, 'value_net.pth'), self.device)
+        self.transition_net = self.transition_net.load(os.path.join(self.model_path, 'transition_net.pth'), self.device)
+        self.actor = self.actor.load(os.path.join(self.model_path, 'actor.pth'), self.device)
+        self.value_net = self.value_net.load(os.path.join(self.model_path, 'value_net.pth'), self.device)
+        self.target_net.load_state_dict(self.value_net.state_dict(), self.device)
+        self.current_epoch = int(self.model_path.split('epoch-')[1]) + 1
 
         if self.log_alpha is not None:
             saved_log_alpha = torch.load(os.path.join(self.model_path, 'log_alpha.pt'))
@@ -690,7 +691,7 @@ class Agent:
         with torch.no_grad():
             actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
 
-            targe_net_input = torch.cat([state_batch_t2, actions_batch_t2], dim=1)
+            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
             target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
 
             # H_t2 ~ -log_prob_t2
@@ -807,7 +808,7 @@ class Agent:
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
         self.warmup()
-        for epoch in range(self.n_epochs):
+        for epoch in range(self.current_epoch, self.n_epochs):
             for cycle in range(self.steps_per_epoch):
                 step = self.steps_per_epoch * epoch + cycle
                 self.writer.set_step(step)
@@ -905,36 +906,23 @@ class Agent:
                 imageio.mimsave(self.video_log_path.format(epoch), images)
 
             if self.should_save_model and epoch > 0 and epoch % self.model_save_timer == 0:
-                self.transition_net.save(os.path.join(self.model_path, 'transition_net.pth'))
-                self.actor.save(os.path.join(self.model_path, 'actor.pth'))
-                self.value_net.save(os.path.join(self.model_path, 'value_net.pth'))
+                epoch_path = self.model_path + "/epoch_" + str(epoch)
+                create_dirs([epoch_path])
+                self.transition_net.save(os.path.join(epoch_path, 'transition_net.pth'))
+                self.actor.save(os.path.join(epoch_path, 'actor.pth'))
+                self.value_net.save(os.path.join(epoch_path, 'value_net.pth'))
 
                 if self.log_alpha is not None:
-                    torch.save(self.log_alpha, os.path.join(self.model_path, 'log_alpha.pt'))
+                    torch.save(self.log_alpha, os.path.join(epoch_path, 'log_alpha.pt'))
 
                 if self.alpha_optimizer is not None:
                     torch.save({"state_dict": self.alpha_optimizer.state_dict()},
-                               os.path.join(self.model_path, 'alpha_optimizer.pt'))
+                               os.path.join(epoch_path, 'alpha_optimizer.pt'))
 
                 if self.alpha_tensor is not None:
-                    torch.save(self.alpha_tensor, os.path.join(self.model_path, 'alpha_tensor.pt'))
+                    torch.save(self.alpha_tensor, os.path.join(epoch_path, 'alpha_tensor.pt'))
 
         self.env.close()
-
-        if self.should_save_model:
-            self.transition_net.save(os.path.join(self.final_model_path, 'transition_net.pth'))
-            self.actor.save(os.path.join(self.final_model_path, 'actor.pth'))
-            self.value_net.save(os.path.join(self.final_model_path, 'value_net.pth'))
-
-            if self.log_alpha is not None:
-                torch.save(self.log_alpha, os.path.join(self.final_model_path, 'log_alpha.pt'))
-
-            if self.alpha_optimizer is not None:
-                torch.save({"state_dict": self.alpha_optimizer.state_dict()},
-                           os.path.join(self.final_model_path, 'alpha_optimizer.pt'))
-
-            if self.alpha_tensor is not None:
-                torch.save(self.alpha_tensor, os.path.join(self.final_model_path, 'alpha_tensor.pt'))
 
         # Print and keep a (.txt) record of stuff
         print("Training finished at {}".format(datetime.now()))
@@ -1141,6 +1129,7 @@ def train_agent_according_config(config):
     print(f'Action LB: {float(env.action_space.low[0])}')
 
     agent = Agent(env, config)
+    # agent.restore()
     agent.train()
 
 

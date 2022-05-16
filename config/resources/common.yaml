@@ -1,5 +1,5 @@
-experiment_name: efe-as-sac-v15
-experiment_description: "baseline alg"
+experiment_name: efe-as-sac-v17
+experiment_description: "fix her sampling"
 
 #experiment_name: efe-as-sac-v15
 #experiment_description: "use true alg"
@@ -13,7 +13,7 @@ hparams:
   steps_per_epoch: 50
   n_training_iterations: 10
   n_rollout_episodes: 10
-  n_warmap_episodes: 20
+  n_warmap_episodes: 100
 
 should_save_model: true
 model_path: models\{experiment_name}
