@@ -302,6 +302,7 @@ class Actor(BasePolicy):
             input_size,
             net_arch,
             action_distribution_type,
+            device,
             weight_decay=0.00001,
             lr=0.0001,
             activation_fn=nn.ReLU,
@@ -330,7 +331,7 @@ class Actor(BasePolicy):
         action_dim = get_action_dim(self.action_space)
         # here will be vae
         self.latent_pi = nn.Sequential(*create_mlp(input_size, -1, net_arch, activation_fn))
-
+        self.device = device
         last_layer_dim = net_arch[-1]
 
         if self.action_distribution_type == 'StateDependentNoiseDistribution':
@@ -362,6 +363,8 @@ class Actor(BasePolicy):
         self.clip_mean = clip_mean
         self.normalize_images = normalize_images
 
+        self.to(device)
+
     def _get_constructor_parameters(self):
         data = super()._get_constructor_parameters()
 
@@ -381,6 +384,7 @@ class Actor(BasePolicy):
                 use_expln=self.use_expln,
                 clip_mean=self.clip_mean,
                 normalize_images=self.normalize_images,
+                device=self.device,
             )
         )
         return data
@@ -870,11 +874,13 @@ class Agent:
         assert (self.n_rollout_episodes >= self.observations_seq_len)
         assert (self.n_warmap_episodes >= self.observations_seq_len)
 
+        self.current_epoch = 0
         self.actor = Actor(env.observation_space, env.action_space,
                            self.state_size,
                            OmegaConf.to_object(config.hparams.actor_layers),
                            action_distribution_type=self.actor_action_distribution,
-                           lr=config.hparams.actor_lr)
+                           lr=config.hparams.actor_lr,
+                           device=self.device)
 
         self.value_net = MLP(self.state_size + self.action_dim,
                              OmegaConf.to_object(config.hparams.value_net_layers),
@@ -1203,7 +1209,6 @@ class Agent:
 
         self.env.close()
         print("Training finished at {}".format(datetime.now()))
-        success_rate, reward, _ = self._eval_agent(0)
         return success_rate, reward
 
 
