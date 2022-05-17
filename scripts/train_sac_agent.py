@@ -508,12 +508,6 @@ class Agent:
                            use_sde=config.hparams.use_sde,
                            lr=config.hparams.actor_lr)
 
-        self.transition_net = MLP(self.state_size + self.action_dim,
-                                  OmegaConf.to_object(config.hparams.transition_net_layers),
-                                  self.state_size,
-                                  lr=config.hparams.value_net_lr,
-                                  device=self.device)
-
         self.value_net = MLP(self.state_size + self.action_dim,
                              OmegaConf.to_object(config.hparams.value_net_layers),
                              1,
@@ -604,18 +598,9 @@ class Agent:
 
         reward_batch, done_batch = self.as_tensor(reward_batch), self.as_tensor(done_batch)
 
-        # At time t0 predict the state at time t1:
-        # append actions vector nearby state
-        X = torch.cat((state_batch_t0, actions_batch_t0), dim=1)
-        pred_batch_t0t1 = self.transition_net(X)
-
-        # Determine the prediction error wrt time t0-t1:
-        pred_error_batch_t0t1 = torch.mean(
-            F.mse_loss(pred_batch_t0t1, state_batch_t1, reduction='none'), dim=1).unsqueeze(1)
-
         return (state_batch_t0, state_batch_t1, state_batch_t2,
                 actions_batch_t0, actions_batch_t1, actions_batch_t2,
-                reward_batch, done_batch, pred_error_batch_t0t1)
+                reward_batch, done_batch)
 
     def _update_network(self):
         # stable-baseline-3 implementation
@@ -626,7 +611,7 @@ class Agent:
         # Retrieve transition data in mini batches:
         (state_batch_t0, state_batch_t1, state_batch_t2,
          actions_batch_t0, actions_batch_t1, actions_batch_t2,
-         reward_batch, done_batch, pred_error_batch_t0t1) = self.get_mini_batches()
+         reward_batch, done_batch) = self.get_mini_batches()
 
         # Action by the current actor for the sampled state
         actions_pi, log_prob = self.actor.action_log_prob(state_batch_t1)
