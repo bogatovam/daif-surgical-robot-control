@@ -1,4 +1,4 @@
-env_id: "NeedleGrasp-v0"
+env_id: "PegTransfer-v0"
 
 hparams:
   polyak: 0.95
@@ -42,7 +42,7 @@ hparams:
 # Disentangled Beta-VAE
 # LogCosh
 # original
-  vae_type: original
+  vae_type: none
   observations_seq_len: 8 # default 3
 
 vae:

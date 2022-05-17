@@ -807,7 +807,7 @@ class Agent:
         self.writer.add_text(self.experiment_name, self.experiment_description)
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
-        self.warmup()
+        # self.warmup()
         for epoch in range(self.current_epoch, self.n_epochs):
             for cycle in range(self.steps_per_epoch):
                 step = self.steps_per_epoch * epoch + cycle

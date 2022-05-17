@@ -1,7 +1,10 @@
 import os
+import random
 import sys
 from datetime import datetime
 from typing import List, Any
+
+import gym
 import torch
 from torch import nn, Tensor
 from abc import abstractmethod
@@ -9,6 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from base import BaseModel
+from config import get_config
 from logger import TensorboardWriter
 from config.const import ROOT_DIR_PATH
 import numpy as np
@@ -38,7 +42,7 @@ class BaseVAE(BaseModel):
         pass
 
     @abstractmethod
-    def loss_function(self, *inputs: Any, **kwargs) -> Tensor:
+    def loss_function(self, *inputs: Any, **kwargs):
         pass
 
 
@@ -169,7 +173,7 @@ class VanillaVAE(BaseVAE):
 
     def loss_function(self,
                       *args,
-                      **kwargs) -> dict:
+                      **kwargs):
         """
         Computes the VAE loss function.
         KL(N(\mu, \sigma), N(0, 1)) = \log \frac{1}{\sigma} + \frac{\sigma^2 + \mu^2}{2} - \frac{1}{2}
@@ -188,7 +192,7 @@ class VanillaVAE(BaseVAE):
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
 
         loss = recons_loss + kld_weight * kld_loss
-        return {'loss': loss, 'Reconstruction_Loss': recons_loss.detach(), 'KLD': -kld_loss.detach()}
+        return loss, recons_loss.detach(), -kld_loss.detach()
 
     def sample(self,
                num_samples: int,
@@ -351,7 +355,7 @@ class LogCoshVAE(BaseVAE):
 
     def loss_function(self,
                       *args,
-                      **kwargs) -> dict:
+                      **kwargs):
         """
         Computes the VAE loss function.
         KL(N(\mu, \sigma), N(0, 1)) = \log \frac{1}{\sigma} + \frac{\sigma^2 + \mu^2}{2} - \frac{1}{2}
@@ -379,7 +383,7 @@ class LogCoshVAE(BaseVAE):
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
 
         loss = recons_loss + self.beta * kld_weight * kld_loss
-        return {'loss': loss, 'Reconstruction_Loss': recons_loss, 'KLD': -kld_loss}
+        return loss, recons_loss.detach(), -kld_loss.detach()
 
     def sample(self,
                num_samples: int,
@@ -415,6 +419,7 @@ class BetaVAE(BaseVAE):
     def __init__(self,
                  in_channels: int,
                  latent_dim: int,
+                 device,
                  hidden_dims: List = None,
                  beta: int = 4,
                  gamma: float = 1000.,
@@ -423,7 +428,7 @@ class BetaVAE(BaseVAE):
                  loss_type: str = 'B',
                  **kwargs) -> None:
         super(BetaVAE, self).__init__()
-
+        self.device = device
         self.in_channels = in_channels
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
@@ -499,6 +504,7 @@ class BetaVAE(BaseVAE):
 
         data.update(
             dict(
+                devicie=self.device,
                 in_channels=self.in_channels,
                 latent_dim=self.latent_dim,
                 hidden_dims=self.hidden_dims,
@@ -554,7 +560,7 @@ class BetaVAE(BaseVAE):
 
     def loss_function(self,
                       *args,
-                      **kwargs) -> dict:
+                      **kwargs):
         self.num_iter += 1
         recons = args[0]
         input = args[1]
@@ -574,8 +580,7 @@ class BetaVAE(BaseVAE):
             loss = recons_loss + self.gamma * kld_weight * (kld_loss - C).abs()
         else:
             raise ValueError('Undefined loss type.')
-
-        return {'loss': loss, 'Reconstruction_Loss': recons_loss, 'KLD': kld_loss}
+        return loss, recons_loss.detach(), -kld_loss.detach()
 
     def sample(self,
                num_samples: int,
@@ -794,6 +799,31 @@ class EpisodeData:
         return data_as_dict
 
 
+def make_env(config):
+    if config.render_mode == 'none':
+        env = gym.make(config.env_id)
+    else:
+        env = gym.make(config.env_id, render_mode=config.render_mode)
+    # env = Monitor(env, prepare_path(config.monitor_file, experiment_name=config.experiment_name))
+    env.seed(config.seed)
+    return env
+
+
+def set_random_seed(seed: int, device: str = 'cpu') -> None:
+    # Seed python RNG
+    random.seed(seed)
+    # Seed numpy RNG
+    np.random.seed(seed)
+    # seed the RNG for all devices (both CPU and CUDA)
+    torch.manual_seed(seed)
+
+    if device == 'cuda':
+        # Deterministic operations for CuDNN, it may impact performances
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.cuda.manual_seed_all(seed)
+
+
 def interpret_boolean(param):
     if type(param) == bool:
         return param
@@ -829,14 +859,15 @@ class VAETrainer:
 
         self.batch_size = int(config.vae.hparams.batch_size)
         self.memory_capacity = int(config.vae.hparams.memory_capacity)
-        self.image_shape = int(config.vae.hparams.image_shape)
+        self.image_shape = config.vae.hparams.image_shape
+        self.device = config.device_id
 
         if self.vae_type == 'original':
-            self.images_vae = VanillaVAE(3, 64)
+            self.images_vae = VanillaVAE(3, 64, self.device)
         elif self.vae_type == 'LogCosh':
-            self.images_vae = LogCoshVAE(3, 64)
+            self.images_vae = LogCoshVAE(3, 64, self.device)
         elif self.vae_type == 'LogCosh':
-            self.images_vae = BetaVAE(3, 64)
+            self.images_vae = BetaVAE(3, 64, self.device)
 
         self.sampler = SimpleSampler(self.vae_seq_len,
                                      self.env.compute_reward)
@@ -847,8 +878,7 @@ class VAETrainer:
         self.writer = TensorboardWriter(prepare_path(config.vae.tb_log_folder, experiment_name=config.experiment_name),
                                         True)
 
-        self.train_metrics = MetricTracker('loss', 'val/loss', writer=self.writer)
-        self.device = config.device_id
+        self.train_metrics = MetricTracker('loss', 'recons_loss', 'kld_loss', writer=self.writer)
 
     def _reset(self):
         self.train_metrics.reset()
@@ -870,18 +900,21 @@ class VAETrainer:
     def _update_network(self):
         (sequential_batches, _, _) = self.buffer.sample(self.batch_size)
 
-        encoder_input = self._preprocess_batch_images(sequential_batches) # (batch, seq, h, w, c)
-        encoder_input = encoder_input.view(vae_batch_size, self.c, self.h, self.w, self.n_screens)
+        encoder_input = self._preprocess_batch_images(sequential_batches)  # (batch, seq, h, w, c)
+        encoder_input = encoder_input.reshape(self.batch_size, 3, self.image_shape[0], self.image_shape[1],
+                                              self.vae_seq_len)
 
-        recon, _, mu, logvar = self.images_vae.forward(obs_batch)
-        loss = torch.mean(self.images_vae.loss_function(recon, obs_batch, mu, logvar))
+        recon, _, mu, logvar = self.images_vae.forward(encoder_input)
+        loss, recons_loss, kld_loss = self.images_vae.loss_function(recon, encoder_input, mu, logvar)
 
-        self.vae.optimizer.zero_grad()
+        self.images_vae.optimizer.zero_grad()
         loss.backward()
-        self.vae.optimizer.step()
+        self.images_vae.optimizer.step()
 
         metrics = dict(
-            loss=vfe.item()
+            loss=loss.item(),
+            recons_loss=recons_loss.item(),
+            kld_loss=kld_loss.item()
         )
         return metrics
 
@@ -942,3 +975,18 @@ class VAETrainer:
 
         self.env.close()
         print("Training finished at {}".format(datetime.now()))
+
+
+def train_agent_according_config(config):
+    env = make_env(config)
+    set_random_seed(config.seed, config.device_id)
+    print(f'Actions count: {env.action_space.shape}')
+    print(f'Action UB:   {float(env.action_space.high[0])}')
+    print(f'Action LB: {float(env.action_space.low[0])}')
+
+    agent = VAETrainer(env, config)
+    return agent.train()
+
+
+if __name__ == '__main__':
+    train_agent_according_config(get_config(env_id='NeedleReach-v0', device='cpu'))

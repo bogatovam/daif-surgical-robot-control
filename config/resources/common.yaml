@@ -1,5 +1,5 @@
-experiment_name: efe-as-sac-v17
-experiment_description: "fix her sampling"
+experiment_name: efe-as-sac-v18
+experiment_description: "just to test reward"
 
 #experiment_name: efe-as-sac-v15
 #experiment_description: "use true alg"
