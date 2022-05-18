@@ -1,4 +1,4 @@
-experiment_name: efe-as-sac-v18
+experiment_name: NeedleGrasp-mlp-daif
 experiment_description: "just to test reward"
 
 #experiment_name: efe-as-sac-v15
@@ -9,15 +9,15 @@ tb_log_folder: logs\tensorboard\{experiment_name}
 seed: 42
 
 hparams:
-  n_epochs: 50
-  steps_per_epoch: 50
+  n_epochs: 200
+  steps_per_epoch: 200
   n_training_iterations: 10
-  n_rollout_episodes: 10
-  n_warmap_episodes: 100
+  n_rollout_episodes: 3
+  n_warmap_episodes: 50
 
 should_save_model: true
-model_path: models\{experiment_name}
-model_save_timer: 1
+model_path: models\efe-as-sac-v17\epoch_49
+model_save_timer: 10
 
 
 should_save_episode_video: true

@@ -56,21 +56,19 @@ class ReplayBuffer:
         self.achieved_goal_memory = np.empty([self.size, self.max_episode_steps, self.goal_dim], dtype=np.float32)
         self.desired_goal_memory = np.empty([self.size, self.max_episode_steps, self.goal_dim], dtype=np.float32)
         self.actions_memory = np.empty([self.size, self.max_episode_steps, self.action_dim], dtype=np.float32)
-
-        # thread lock
-        self.lock = threading.Lock()
+        self.info_memory = np.empty([self.size, self.max_episode_steps, 1], dtype=object)
 
     # store the episode
-    def store_episode(self, observation, achieved_goal, desired_goal, action, n_episodes_to_store):
-        with self.lock:
-            ids = self._get_storage_idx(inc=n_episodes_to_store)
-            # store the information
-            self.observation_memory[ids] = observation
-            self.achieved_goal_memory[ids] = achieved_goal
-            self.desired_goal_memory[ids] = desired_goal
-            self.actions_memory[ids] = action
+    def store_episode(self, observation, achieved_goal, desired_goal, action, n_episodes_to_store, info):
+        ids = self._get_storage_idx(inc=n_episodes_to_store)
+        # store the information
+        self.observation_memory[ids] = observation
+        self.achieved_goal_memory[ids] = achieved_goal
+        self.desired_goal_memory[ids] = desired_goal
+        self.actions_memory[ids] = action
+        self.info_memory[ids] = np.expand_dims(info, -1)
 
-            self.n_transitions_stored += self.max_episode_steps * n_episodes_to_store
+        self.n_transitions_stored += self.max_episode_steps * n_episodes_to_store
 
     # sample the data from the replay buffer
     def sample(self, batch_size):
@@ -78,10 +76,11 @@ class ReplayBuffer:
         achieved_goal_buffer = self.achieved_goal_memory[:self.current_size]
         desired_goal_buffer = self.desired_goal_memory[:self.current_size]
         actions_buffer = self.actions_memory[:self.current_size]
+        info_buffer = self.info_memory[:self.current_size]
 
         return self.sample_func(observation_buffer,
                                 achieved_goal_buffer, desired_goal_buffer,
-                                actions_buffer,
+                                actions_buffer, info_buffer,
                                 batch_size)
 
     def _get_storage_idx(self, inc=None):
@@ -114,7 +113,7 @@ class HERSampler:
 
     def sample_her_transitions(self, observation_buffer,
                                achieved_goal_buffer, desired_goal_buffer,
-                               actions_buffer, batch_size):
+                               actions_buffer, info_buffer, batch_size):
         # Trajectory length
         trajectory_length = actions_buffer.shape[1]
 
@@ -139,15 +138,16 @@ class HERSampler:
         sequential_batches = []
         for time_i in range(self.seq_len):
             t_i = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
+                                        info_buffer,
                                         episode_ids, t_samples, her_indexes, future_t,
                                         batch_size=batch_size, time=time_i)
             sequential_batches.append(t_i)
 
-        (_, achieved_goal_batch_t1, desired_goal_batch_t1, _) = sequential_batches[-2]
+        (_, achieved_goal_batch_t1, desired_goal_batch_t1, _, info) = sequential_batches[-2]
 
         # Recompute the reward for the augmented 'desired_goal'
         # todo use achieved_goal_batch_t2 and desired_goal_batch_t1?
-        reward_batch = self.reward_func(achieved_goal_batch_t1, desired_goal_batch_t1, info=None)
+        reward_batch = self.reward_func(achieved_goal_batch_t1, desired_goal_batch_t1, info=info)
         # Recompute the termination state for the augmented 'desired_goal'
         done_batch = reward_batch == 0
 
@@ -164,24 +164,31 @@ class HERSampler:
         return sequential_batches, reward_batch, done_batch
 
     def _sample_for_time(self, observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
+                         info_buffer,
                          episode_idxs, t_samples, her_indexes, future_t, batch_size, time):
         observation_batch = observation_buffer[:, time:, :][episode_idxs, t_samples].copy()
         achieved_goal_batch = achieved_goal_buffer[:, time:, :][episode_idxs, t_samples].copy()
         desired_goal_batch = desired_goal_buffer[:, time:, :][episode_idxs, t_samples].copy()
         actions_batch = actions_buffer[:, time:, :][episode_idxs, t_samples].copy()
+        info_batch = info_buffer[:, time:, :][episode_idxs, t_samples].copy()
 
         # Reshape the batch
         observation_batch = observation_batch.reshape(batch_size, *observation_batch.shape[1:])
         achieved_goal_batch = achieved_goal_batch.reshape(batch_size, *achieved_goal_batch.shape[1:])
         desired_goal_batch = desired_goal_batch.reshape(batch_size, *desired_goal_batch.shape[1:])
         actions_batch = actions_batch.reshape(batch_size, *actions_batch.shape[1:])
+        info_batch = info_batch.reshape(batch_size)
+        info_batch = {k: [dic[k] for dic in info_batch] for k in info_batch[0]}
+
+        for k, v in info_batch.items():
+            info_batch[k] = np.expand_dims(np.asarray(v), -1)
 
         # Get the achieved_goal at the 'future' timestamps
         next_achieved_goal = achieved_goal_buffer[:, time:, :][episode_idxs[her_indexes], future_t]
         # Replace the 'desired_goal' with the 'next_achieved_goal'
         desired_goal_batch[her_indexes] = next_achieved_goal
 
-        return observation_batch, achieved_goal_batch, desired_goal_batch, actions_batch
+        return observation_batch, achieved_goal_batch, desired_goal_batch, actions_batch, info_batch
 
 
 class Normalizer:
@@ -469,7 +476,7 @@ class TransitionModelRnnPreprocessor:
     def preprocess(self, sequence_of_batches):
         final_batch = []
         for time in range(len(sequence_of_batches)):
-            (observation_batch, _, desired_goal_batch, actions_batch) = sequence_of_batches[time]
+            (observation_batch, _, desired_goal_batch, actions_batch, _) = sequence_of_batches[time]
             state_batch = self.preprocess_func(observation_batch, desired_goal_batch)
             final_batch.append(torch.cat((state_batch, as_tensor(actions_batch, self.device)), dim=1))
         return torch.stack(final_batch, dim=1)
@@ -603,16 +610,18 @@ class EpisodeData:
         self.achieved_goal = []
         self.desired_goal = []
         self.action = []
+        self.info = []
 
-    def add(self, observation, achieved_goal, desired_goal, action):
+    def add(self, observation, achieved_goal, desired_goal, action, info):
         self.observation.append(observation)
         self.achieved_goal.append(achieved_goal)
         self.desired_goal.append(desired_goal)
         self.action.append(action)
+        self.info.append(info)
 
     def as_numpy_arrays(self):
         return np.asarray(self.observation), np.asarray(self.achieved_goal), \
-               np.asarray(self.desired_goal), np.asarray(self.action)
+               np.asarray(self.desired_goal), np.asarray(self.action), np.asarray(self.info)
 
     @classmethod
     def as_dict_of_numpy_arrays(cls, collected_step_episodes):
@@ -631,20 +640,34 @@ class EpisodeSummary:
     def __init__(self):
         self.done = []
         self.reward = []
+        self.goal_distance = []
+        self.jaw_state = []
 
-    def add(self, reward, done):
-        self.done.append(done)
+    def add(self, reward, info):
+        if 'goal_distance' in info:
+            self.goal_distance.append(info['goal_distance'])
+        if 'jaw_state' in info:
+            self.jaw_state.append(info['jaw_state'])
+        self.done.append(info['is_success'])
         self.reward.append(reward)
 
+    def add_with_no_transformation(self, reward, done, goal_distance, jaw_state):
+        self.reward.append(reward)
+        self.done.append(done)
+        self.goal_distance.append(goal_distance)
+        self.jaw_state.append(jaw_state)
+
     def calc_summary(self):
-        return np.mean(self.reward), np.mean(self.done)
+        return np.mean(self.reward), np.mean(self.done), \
+               np.mean(self.goal_distance) if len(self.goal_distance) > 0 else -1, \
+               np.mean(self.jaw_state) if len(self.jaw_state) > 0 else -1
 
     @classmethod
     def as_dict_of_values(cls, collected_step_summary):
         data = EpisodeSummary()
 
         for elem in collected_step_summary:
-            data.add(*elem.calc_summary())
+            data.add_with_no_transformation(*elem.calc_summary())
 
         data_as_dict = data.__dict__
         for key, value in data.__dict__.items():
@@ -959,7 +982,7 @@ class Agent:
 
         self.train_metrics = MetricTracker('vfe', 'value_net_loss', 'alpha', 'alpha_loss', 'success_rate', 'reward',
                                            'transition_net_grad', 'actor_grad_acc', 'value_net_grad',
-                                           'sde_std', 'transition_net_loss',
+                                           'sde_std', 'transition_net_loss', 'goal_distance', 'jaw_state',
                                            writer=self.writer)
 
         self.val_metrics = MetricTracker('val/success_rate', 'val/reward', writer=self.writer)
@@ -998,8 +1021,8 @@ class Agent:
 
         transition_model_raw_input, t1, t2 = sequential_batches[:-2], sequential_batches[-2], sequential_batches[-1]
 
-        (observation_batch_t1, achieved_goal_batch_t1, desired_goal_batch_t1, actions_batch_t1) = t1
-        (observation_batch_t2, achieved_goal_batch_t2, desired_goal_batch_t2, actions_batch_t2) = t2
+        (observation_batch_t1, achieved_goal_batch_t1, desired_goal_batch_t1, actions_batch_t1, _) = t1
+        (observation_batch_t2, achieved_goal_batch_t2, desired_goal_batch_t2, actions_batch_t2, _) = t2
 
         state_batch_t1 = self._preprocess_batch_inputs(observation_batch_t1, desired_goal_batch_t1)
         state_batch_t2 = self._preprocess_batch_inputs(observation_batch_t2, desired_goal_batch_t2)
@@ -1117,7 +1140,7 @@ class Agent:
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
         self.warmup()
-        for epoch in range(self.current_epoch, self.n_epochs):
+        for epoch in range(self.current_epoch, self.n_epochs + 1):
             for cycle in range(self.steps_per_epoch):
                 step = self.steps_per_epoch * epoch + cycle
                 self.writer.set_step(step)
@@ -1136,8 +1159,9 @@ class Agent:
                         # feed the actions into the environment
                         new_observation, reward, _, info = self.env.step(action)
 
-                        episode_data.add(observation.copy(), achieved_goal.copy(), desired_goal.copy(), action.copy())
-                        episode_summary.add(np.mean(reward), info['is_success'])
+                        episode_data.add(observation.copy(), achieved_goal.copy(), desired_goal.copy(), action.copy(),
+                                         info)
+                        episode_summary.add(np.mean(reward), info)
 
                         observation = new_observation['observation']
                         achieved_goal = new_observation['achieved_goal']
@@ -1176,6 +1200,8 @@ class Agent:
 
                 self.train_metrics.update('success_rate', success_rate)
                 self.train_metrics.update('reward', reward)
+                self.train_metrics.update('goal_distance', collected_step_summary['goal_distance'])
+                self.train_metrics.update('jaw_state', collected_step_summary['jaw_state'])
                 self.log_models_parameters()
 
                 print("Epoch: {:4d}, Step: {:4d}, reward: {:3.2f}, success_rate: {:3.2f}".format(epoch, cycle,
@@ -1210,7 +1236,6 @@ class Agent:
         self.env.close()
         print("Training finished at {}".format(datetime.now()))
         return success_rate, reward
-
 
     def log_models_parameters(self):
         # add histogram of model parameters to the tensorboard
@@ -1253,7 +1278,7 @@ class Agent:
         inputs = np.concatenate([observation_batch, goal_batch], axis=1)
         return torch.tensor(inputs, dtype=torch.float32, device=self.device)
 
-    def _update_normalizer(self, observation, achieved_goal, desired_goal, action):
+    def _update_normalizer(self, observation, achieved_goal, desired_goal, action, info):
         # get the number of normalization transitions
         num_transitions = action.shape[0]
         # create the new buffer to store them
@@ -1261,67 +1286,47 @@ class Agent:
                                                                                               achieved_goal,
                                                                                               desired_goal,
                                                                                               action,
+                                                                                              np.expand_dims(info, -1),
                                                                                               num_transitions)
 
-        (observation_batch, _, desired_goal_batch, actions) = sequential_batches[0]
+        (observation_batch, _, desired_goal_batch, _, _) = sequential_batches[0]
 
         # update
         self.o_norm.update(observation_batch)
         self.g_norm.update(desired_goal_batch)
-        self.a_norm.update(actions)
+        # self.a_norm.update(actions)
         # recompute the stats
         self.o_norm.recompute_stats()
         self.g_norm.recompute_stats()
-        self.a_norm.recompute_stats()
+        # self.a_norm.recompute_stats()
 
     def warmup(self):
-        for step in range(1):
-            cycle_summary_data = {'done': [], 'reward': []}
-            cycle_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
+        collected_step_episodes = []
+        for _ in range(self.n_warmap_episodes):
 
-            for _ in range(self.n_warmap_episodes):
-                observation, achieved_goal, desired_goal, done, reward = self._reset()
+            episode_data = EpisodeData()
+            observation, achieved_goal, desired_goal, done, reward = self._reset()
 
-                episode_summary_data = {'done': [], 'reward': []}
-                episode_data = {'observation': [], 'achieved_goal': [], 'desired_goal': [], 'action': []}
+            for episode_step in range(self._max_episode_steps):
+                input_tensor = self._preprocess_inputs(observation, desired_goal)
+                action = self._select_action(input_tensor)
 
-                for episode_step in range(self._max_episode_steps):
-                    input_tensor = self._preprocess_inputs(observation, desired_goal)
-                    action = self._select_action(input_tensor)
+                # feed the actions into the environment
+                new_observation, reward, _, info = self.env.step(action)
 
-                    episode_data['observation'].append(observation.copy())
-                    episode_data['achieved_goal'].append(achieved_goal.copy())
-                    episode_data['desired_goal'].append(desired_goal.copy())
-                    episode_data['action'].append(action.copy())
+                episode_data.add(observation.copy(), achieved_goal.copy(), desired_goal.copy(), action.copy(),
+                                 info)
 
-                    # feed the actions into the environment
-                    new_observation, reward, _, info = self.env.step(action)
+                observation = new_observation['observation']
+                achieved_goal = new_observation['achieved_goal']
 
-                    episode_summary_data['reward'].append(np.mean(reward))
-                    episode_summary_data['done'].append(info['is_success'])
+            collected_step_episodes.append(episode_data)
 
-                    observation = new_observation['observation']
-                    achieved_goal = new_observation['achieved_goal']
+        collected_step_episodes = EpisodeData.as_dict_of_numpy_arrays(collected_step_episodes)
 
-                cycle_data['observation'].append(np.asarray(episode_data['observation'], dtype=np.float32))
-                cycle_data['achieved_goal'].append(np.asarray(episode_data['achieved_goal'], dtype=np.float32))
-                cycle_data['desired_goal'].append(np.asarray(episode_data['desired_goal'], dtype=np.float32))
-                cycle_data['action'].append(np.asarray(episode_data['action'], dtype=np.float32))
-
-                cycle_summary_data['done'].append(np.mean(episode_summary_data['done']))
-                cycle_summary_data['reward'].append(np.mean(episode_summary_data['reward']))
-
-            cycle_data['observation'] = np.asarray(cycle_data['observation'], dtype=np.float32)
-            cycle_data['achieved_goal'] = np.asarray(cycle_data['achieved_goal'], dtype=np.float32)
-            cycle_data['desired_goal'] = np.asarray(cycle_data['desired_goal'], dtype=np.float32)
-            cycle_data['action'] = np.asarray(cycle_data['action'], dtype=np.float32)
-
-            cycle_summary_data['done'] = np.asarray(cycle_summary_data['done'], dtype=np.float32)
-            cycle_summary_data['reward'] = np.asarray(cycle_summary_data['reward'], dtype=np.float32)
-
-            # store the episodes
-            self.buffer.store_episode(**cycle_data, n_episodes_to_store=self.n_warmap_episodes)
-            self._update_normalizer(**cycle_data)
+        # store the episodes
+        self.buffer.store_episode(**collected_step_episodes, n_episodes_to_store=self.n_warmap_episodes)
+        self._update_normalizer(**collected_step_episodes)
 
 
 def make_env(config):
@@ -1404,4 +1409,4 @@ def train_agent_according_config(config):
 
 
 if __name__ == '__main__':
-    train_agent_according_config(get_config(env_id='NeedleReach-v0', device='cpu'))
+    train_agent_according_config(get_config(env_id='NeedleGrasp-v0', device='cpu'))

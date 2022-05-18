@@ -3,10 +3,11 @@ import random
 import sys
 from datetime import datetime
 from typing import List, Any
+import surrol.gym as surrol_gym
 
 import gym
 import torch
-from torch import nn, Tensor
+from torch import nn, Tensor, optim
 from abc import abstractmethod
 from torch import nn
 from torch.nn import functional as F
@@ -52,36 +53,38 @@ class VanillaVAE(BaseVAE):
                  in_channels: int,
                  latent_dim: int,
                  hidden_dims: List = None,
+                 device='cpu',
                  **kwargs) -> None:
         super(VanillaVAE, self).__init__()
 
         self.in_channels = in_channels
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
-
+        self.device = device
         modules = []
         if hidden_dims is None:
-            hidden_dims = [32, 64, 128, 256, 512]
+            hidden_dims = [16, 32, 64, 128, 256]
 
         # Build Encoder
         for h_dim in hidden_dims:
             modules.append(
                 nn.Sequential(
                     nn.Conv3d(in_channels, out_channels=h_dim,
-                              kernel_size=3, stride=2, padding=1),
+                              kernel_size=(3, 3, 1), stride=(2, 2, 1),
+                              padding=(1, 1, 0)),
                     nn.BatchNorm3d(h_dim),
                     nn.LeakyReLU())
             )
             in_channels = h_dim
 
         self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(hidden_dims[-1] * 4, latent_dim)
-        self.fc_var = nn.Linear(hidden_dims[-1] * 4, latent_dim)
+        self.fc_mu = nn.Linear(hidden_dims[-1] * 16, latent_dim)
+        self.fc_var = nn.Linear(hidden_dims[-1] * 16, latent_dim)
 
         # Build Decoder
         modules = []
 
-        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 4)
+        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 16)
 
         hidden_dims.reverse()
 
@@ -90,10 +93,10 @@ class VanillaVAE(BaseVAE):
                 nn.Sequential(
                     nn.ConvTranspose3d(hidden_dims[i],
                                        hidden_dims[i + 1],
-                                       kernel_size=3,
-                                       stride=2,
-                                       padding=1,
-                                       output_padding=1),
+                                       kernel_size=(3, 3, 1),
+                                       stride=(2, 2, 1),
+                                       padding=(1, 1, 0),
+                                       output_padding=(1, 1, 0), ),
                     nn.BatchNorm3d(hidden_dims[i + 1]),
                     nn.LeakyReLU())
             )
@@ -103,14 +106,18 @@ class VanillaVAE(BaseVAE):
         self.final_layer = nn.Sequential(
             nn.ConvTranspose3d(hidden_dims[-1],
                                hidden_dims[-1],
-                               kernel_size=3,
-                               stride=2,
-                               padding=1,
-                               output_padding=1),
+                               kernel_size=(3, 3, 1),
+                               stride=(2, 2, 1),
+                               padding=(1, 1, 0),
+                               output_padding=(1, 1, 0)),
             nn.BatchNorm3d(hidden_dims[-1]),
             nn.LeakyReLU(),
             nn.Conv3d(hidden_dims[-1], out_channels=3, kernel_size=3, padding=1),
             nn.Tanh())
+
+        self.optimizer = optim.Adam(self.parameters(), lr=0.0001)
+        print(self)
+        self.to(self.device)
 
     def _get_constructor_parameters(self):
         data = super()._get_constructor_parameters()
@@ -149,7 +156,7 @@ class VanillaVAE(BaseVAE):
         :return: (Tensor) [B x C x H x W]
         """
         result = self.decoder_input(z)
-        result = result.view(-1, 512, 2, 2)
+        result = result.view(-1, 256, 2, 2, 4)
         result = self.decoder(result)
         result = self.final_layer(result)
         return result
@@ -230,6 +237,7 @@ class LogCoshVAE(BaseVAE):
                  hidden_dims: List = None,
                  alpha: float = 100.,
                  beta: float = 10.,
+                 device='cpu',
                  **kwargs) -> None:
         super(LogCoshVAE, self).__init__()
 
@@ -238,30 +246,31 @@ class LogCoshVAE(BaseVAE):
         self.hidden_dims = hidden_dims
         self.alpha = alpha
         self.beta = beta
+        self.device = device
 
         modules = []
         if hidden_dims is None:
-            hidden_dims = [32, 64, 128, 256, 512]
+            hidden_dims = [16, 32, 64, 128, 256]
 
-        # Build Encoder
         for h_dim in hidden_dims:
             modules.append(
                 nn.Sequential(
                     nn.Conv3d(in_channels, out_channels=h_dim,
-                              kernel_size=3, stride=2, padding=1),
+                              kernel_size=(3, 3, 1), stride=(2, 2, 1),
+                              padding=(1, 1, 0)),
                     nn.BatchNorm3d(h_dim),
                     nn.LeakyReLU())
             )
             in_channels = h_dim
 
         self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(hidden_dims[-1] * 4, latent_dim)
-        self.fc_var = nn.Linear(hidden_dims[-1] * 4, latent_dim)
+        self.fc_mu = nn.Linear(hidden_dims[-1] * 16, latent_dim)
+        self.fc_var = nn.Linear(hidden_dims[-1] * 16, latent_dim)
 
         # Build Decoder
         modules = []
 
-        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 4)
+        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 16)
 
         hidden_dims.reverse()
 
@@ -270,28 +279,30 @@ class LogCoshVAE(BaseVAE):
                 nn.Sequential(
                     nn.ConvTranspose3d(hidden_dims[i],
                                        hidden_dims[i + 1],
-                                       kernel_size=3,
-                                       stride=2,
-                                       padding=1,
-                                       output_padding=1),
+                                       kernel_size=(3, 3, 1),
+                                       stride=(2, 2, 1),
+                                       padding=(1, 1, 0),
+                                       output_padding=(1, 1, 0), ),
                     nn.BatchNorm3d(hidden_dims[i + 1]),
                     nn.LeakyReLU())
             )
-
         self.decoder = nn.Sequential(*modules)
 
         self.final_layer = nn.Sequential(
             nn.ConvTranspose3d(hidden_dims[-1],
                                hidden_dims[-1],
-                               kernel_size=3,
-                               stride=2,
-                               padding=1,
-                               output_padding=1),
+                               kernel_size=(3, 3, 1),
+                               stride=(2, 2, 1),
+                               padding=(1, 1, 0),
+                               output_padding=(1, 1, 0)),
             nn.BatchNorm3d(hidden_dims[-1]),
             nn.LeakyReLU(),
-            nn.Conv3d(hidden_dims[-1], out_channels=3,
-                      kernel_size=3, padding=1),
+            nn.Conv3d(hidden_dims[-1], out_channels=3, kernel_size=3, padding=1),
             nn.Tanh())
+
+        self.optimizer = optim.Adam(self.parameters(), lr=0.0001)
+
+        self.to(self.device)
 
     def _get_constructor_parameters(self):
         data = super()._get_constructor_parameters()
@@ -331,7 +342,7 @@ class LogCoshVAE(BaseVAE):
         :return: (Tensor) [B x C x H x W]
         """
         result = self.decoder_input(z)
-        result = result.view(-1, 512, 2, 2)
+        result = result.view(-1, 256, 2, 2, 4)
         result = self.decoder(result)
         result = self.final_layer(result)
         return result
@@ -419,7 +430,7 @@ class BetaVAE(BaseVAE):
     def __init__(self,
                  in_channels: int,
                  latent_dim: int,
-                 device,
+                 device='cpu',
                  hidden_dims: List = None,
                  beta: int = 4,
                  gamma: float = 1000.,
@@ -447,27 +458,28 @@ class BetaVAE(BaseVAE):
 
         modules = []
         if hidden_dims is None:
-            hidden_dims = [32, 64, 128, 256, 512]
+            hidden_dims = [16, 32, 64, 128, 256]
 
-        # Build Encoder
+            # Build Encoder
         for h_dim in hidden_dims:
             modules.append(
                 nn.Sequential(
                     nn.Conv3d(in_channels, out_channels=h_dim,
-                              kernel_size=3, stride=2, padding=1),
+                              kernel_size=(3, 3, 1), stride=(2, 2, 1),
+                              padding=(1, 1, 0)),
                     nn.BatchNorm3d(h_dim),
                     nn.LeakyReLU())
             )
             in_channels = h_dim
 
         self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(hidden_dims[-1] * 4, latent_dim)
-        self.fc_var = nn.Linear(hidden_dims[-1] * 4, latent_dim)
+        self.fc_mu = nn.Linear(hidden_dims[-1] * 16, latent_dim)
+        self.fc_var = nn.Linear(hidden_dims[-1] * 16, latent_dim)
 
         # Build Decoder
         modules = []
 
-        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 4)
+        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 16)
 
         hidden_dims.reverse()
 
@@ -476,10 +488,10 @@ class BetaVAE(BaseVAE):
                 nn.Sequential(
                     nn.ConvTranspose3d(hidden_dims[i],
                                        hidden_dims[i + 1],
-                                       kernel_size=3,
-                                       stride=2,
-                                       padding=1,
-                                       output_padding=1),
+                                       kernel_size=(3, 3, 1),
+                                       stride=(2, 2, 1),
+                                       padding=(1, 1, 0),
+                                       output_padding=(1, 1, 0), ),
                     nn.BatchNorm3d(hidden_dims[i + 1]),
                     nn.LeakyReLU())
             )
@@ -489,15 +501,17 @@ class BetaVAE(BaseVAE):
         self.final_layer = nn.Sequential(
             nn.ConvTranspose3d(hidden_dims[-1],
                                hidden_dims[-1],
-                               kernel_size=3,
-                               stride=2,
-                               padding=1,
-                               output_padding=1),
+                               kernel_size=(3, 3, 1),
+                               stride=(2, 2, 1),
+                               padding=(1, 1, 0),
+                               output_padding=(1, 1, 0)),
             nn.BatchNorm3d(hidden_dims[-1]),
             nn.LeakyReLU(),
-            nn.Conv3d(hidden_dims[-1], out_channels=3,
-                      kernel_size=3, padding=1),
+            nn.Conv3d(hidden_dims[-1], out_channels=3, kernel_size=3, padding=1),
             nn.Tanh())
+        self.optimizer = optim.Adam(self.parameters(), lr=0.0001)
+
+        self.to(self.device)
 
     def _get_constructor_parameters(self):
         data = super()._get_constructor_parameters()
@@ -536,7 +550,7 @@ class BetaVAE(BaseVAE):
 
     def decode(self, z: Tensor) -> Tensor:
         result = self.decoder_input(z)
-        result = result.view(-1, 512, 2, 2)
+        result = result.view(-1, 256, 2, 2, 4)
         result = self.decoder(result)
         result = self.final_layer(result)
         return result
@@ -658,10 +672,10 @@ class ReplayBuffer:
         self.actions_memory = np.empty([self.size, self.max_episode_steps, self.action_dim], dtype=np.float32)
 
     # store the episode
-    def store_episode(self, observation, image, achieved_goal, desired_goal, action, n_episodes_to_store):
+    def store_episode(self, observation, image_observation, achieved_goal, desired_goal, action, n_episodes_to_store):
         ids = self._get_storage_idx(inc=n_episodes_to_store)
         # store the information
-        self.observation_image_memory[ids] = image
+        self.observation_image_memory[ids] = image_observation
         self.observation_memory[ids] = observation
         self.achieved_goal_memory[ids] = achieved_goal
         self.desired_goal_memory[ids] = desired_goal
@@ -846,7 +860,7 @@ class VAETrainer:
 
         self.experiment_name = config.experiment_name
         self.vae_seq_len = config.vae.hparams.vae_seq_len  # The discount rate
-        self._max_episode_steps = env._max_episode_steps
+        self._max_episode_steps = 50
 
         self.n_epochs = int(config.hparams.n_epochs)
         self.steps_per_epoch = int(config.hparams.steps_per_epoch)
@@ -863,11 +877,11 @@ class VAETrainer:
         self.device = config.device_id
 
         if self.vae_type == 'original':
-            self.images_vae = VanillaVAE(3, 64, self.device)
+            self.images_vae = VanillaVAE(3, 64, device=self.device)
         elif self.vae_type == 'LogCosh':
-            self.images_vae = LogCoshVAE(3, 64, self.device)
-        elif self.vae_type == 'LogCosh':
-            self.images_vae = BetaVAE(3, 64, self.device)
+            self.images_vae = LogCoshVAE(3, 64, device=self.device)
+        elif self.vae_type == 'Beta':
+            self.images_vae = BetaVAE(3, 64, device=self.device)
 
         self.sampler = SimpleSampler(self.vae_seq_len,
                                      self.env.compute_reward)
@@ -905,7 +919,7 @@ class VAETrainer:
                                               self.vae_seq_len)
 
         recon, _, mu, logvar = self.images_vae.forward(encoder_input)
-        loss, recons_loss, kld_loss = self.images_vae.loss_function(recon, encoder_input, mu, logvar)
+        loss, recons_loss, kld_loss = self.images_vae.loss_function(recon, encoder_input, mu, logvar, M_N=0.00025)
 
         self.images_vae.optimizer.zero_grad()
         loss.backward()
@@ -939,7 +953,7 @@ class VAETrainer:
                         new_observation, _, _, _ = self.env.step(action)
 
                         image_obs = self.env.render(mode='rgb_array')
-                        image_obs = np.resize(np.cast(image_obs, ), self.image_shape)
+                        image_obs = np.resize(image_obs.astype(np.float32), self.image_shape)
                         image_obs /= 255
                         episode_data.add(observation.copy(), image_obs.copy(),
                                          achieved_goal.copy(), desired_goal.copy(), action.copy())

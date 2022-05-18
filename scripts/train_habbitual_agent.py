@@ -638,7 +638,7 @@ class Agent:
         self.actor = self.actor.load(os.path.join(self.model_path, 'actor.pth'), self.device)
         self.value_net = self.value_net.load(os.path.join(self.model_path, 'value_net.pth'), self.device)
         self.target_net.load_state_dict(self.value_net.state_dict(), self.device)
-        self.current_epoch = int(self.model_path.split('epoch-')[1]) + 1
+        self.current_epoch = int(self.model_path.split('epoch_')[1]) + 1
 
         if self.log_alpha is not None:
             saved_log_alpha = torch.load(os.path.join(self.model_path, 'log_alpha.pt'))
@@ -1123,13 +1123,11 @@ def set_random_seed(seed: int, device: str = 'cpu') -> None:
 
 def train_agent_according_config(config):
     env = make_env(config)
-    set_random_seed(config.seed, config.device_id)
     print(f'Actions count: {env.action_space.shape}')
     print(f'Action UB:   {float(env.action_space.high[0])}')
     print(f'Action LB: {float(env.action_space.low[0])}')
 
     agent = Agent(env, config)
-    # agent.restore()
     agent.train()
 
 
