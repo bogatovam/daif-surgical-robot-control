@@ -192,7 +192,7 @@ class HERSampler:
 
 
 class Normalizer:
-    def __init__(self, size, eps=1e-2, default_clip_range=np.inf):
+    def __init__(self, size, eps=1e-2, defau_clip_range=np.inf):
         self.size = size
         self.eps = eps
         self.default_clip_range = default_clip_range
@@ -462,7 +462,7 @@ class TransitionModelMlpPreprocessor:
         self.device = device
 
     def preprocess(self, sequence_of_batches):
-        (observation_batch, _, desired_goal_batch, actions_batch_t0) = sequence_of_batches[0]
+        (observation_batch, _, desired_goal_batch, actions_batch_t0, _) = sequence_of_batches[0]
         state_batch_t0 = self.preprocess_func(observation_batch, desired_goal_batch)
         return torch.cat((state_batch_t0, as_tensor(actions_batch_t0, self.device)), dim=1)
 
@@ -1409,4 +1409,4 @@ def train_agent_according_config(config):
 
 
 if __name__ == '__main__':
-    train_agent_according_config(get_config(env_id='NeedleGrasp-v0', device='cpu'))
+    train_agent_according_config(get_config(env_id='NeedleReach-v0', device='cpu'))

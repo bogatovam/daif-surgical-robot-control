@@ -454,155 +454,6 @@ class MLP(BaseModel):
             x = layer(x)
         return x
 
-
-class TransitionModelMlpPreprocessor:
-    def __init__(self, preprocess_func, device):
-        super(TransitionModelMlpPreprocessor, self).__init__()
-        self.preprocess_func = preprocess_func
-        self.device = device
-
-    def preprocess(self, sequence_of_batches):
-        (observation_batch, _, desired_goal_batch, actions_batch_t0) = sequence_of_batches[0]
-        state_batch_t0 = self.preprocess_func(observation_batch, desired_goal_batch)
-        return torch.cat((state_batch_t0, as_tensor(actions_batch_t0, self.device)), dim=1)
-
-
-class TransitionModelRnnPreprocessor:
-    def __init__(self, preprocess_func, device):
-        super(TransitionModelRnnPreprocessor, self).__init__()
-        self.preprocess_func = preprocess_func
-        self.device = device
-
-    def preprocess(self, sequence_of_batches):
-        final_batch = []
-        for time in range(len(sequence_of_batches)):
-            (observation_batch, _, desired_goal_batch, actions_batch, _) = sequence_of_batches[time]
-            state_batch = self.preprocess_func(observation_batch, desired_goal_batch)
-            final_batch.append(torch.cat((state_batch, as_tensor(actions_batch, self.device)), dim=1))
-        return torch.stack(final_batch, dim=1)
-
-
-class LSTM(BaseModel):
-    def __init__(self, input_size, layer_sizes, output_size, lr=0.0001, output_activation=torch.nn.Identity,
-                 activation=torch.nn.ReLU, drop_prob=0.2, device='cpu'):
-        super(LSTM, self).__init__()
-
-        # Defining the number of layers and the nodes in each layer
-        self.layer_sizes = layer_sizes
-        self.layer_dim = len(layer_sizes)
-        self.hidden_dim = layer_sizes[0]
-
-        # LSTM layers
-        self.lstm = nn.LSTM(
-            input_size, self.hidden_dim, self.layer_dim, batch_first=True, dropout=drop_prob
-        )
-
-        # Fully connected layer
-        self.fc = nn.Linear(self.hidden_dim, output_size)
-        self.optimizer = optim.Adam(self.parameters(), lr)  # Adam optimizer
-
-        self.device = device
-        self.to(self.device)
-
-        self.input_size = input_size
-        self.layer_sizes = layer_sizes
-        self.output_size = output_size
-        self.lr = lr
-        self.drop_prob = drop_prob
-        self.output_activation = output_activation
-        self.activation = activation
-
-    def forward(self, x):
-        h0 = torch.zeros(self.layer_dim, x.size(0), self.hidden_dim).requires_grad_()
-        c0 = torch.zeros(self.layer_dim, x.size(0), self.hidden_dim).requires_grad_()
-        out, (hn, cn) = self.lstm(x, (h0.detach(), c0.detach()))
-        out = out[:, -1, :]
-        out = self.fc(out)
-        return out
-
-    def _get_constructor_parameters(self):
-        data = super()._get_constructor_parameters()
-
-        data.update(
-            dict(
-                input_size=self.input_size,
-                layer_sizes=self.layer_sizes,
-                output_size=self.output_size,
-                lr=self.lr,
-                output_activation=self.output_activation,
-                activation=self.activation,
-                drop_prob=self.drop_prob,
-                device=self.device,
-            )
-        )
-        return data
-
-
-class GRU(BaseModel):
-    def __init__(self, input_size, layer_sizes, output_size,
-                 lr=0.0001, output_activation=torch.nn.Identity,
-                 activation=torch.nn.ReLU, drop_prob=0.2, device='cpu'):
-        super(GRU, self).__init__()
-
-        # Defining the number of layers and the nodes in each layer
-        self.layer_sizes = layer_sizes
-        self.layer_dim = len(layer_sizes)
-        self.hidden_dim = layer_sizes[0]
-
-        # GRU layers
-        self.gru = nn.GRU(
-            input_size, self.hidden_dim, self.layer_dim, batch_first=True, dropout=drop_prob
-        )
-
-        # Fully connected layer
-        self.fc = nn.Linear(self.hidden_dim, output_size)
-
-        self.optimizer = optim.Adam(self.parameters(), lr)
-
-        self.device = device
-        self.to(self.device)
-
-        self.input_size = input_size
-        self.layer_sizes = layer_sizes
-        self.output_size = output_size
-        self.drop_prob = drop_prob
-        self.lr = lr
-        self.output_activation = output_activation
-        self.activation = activation
-
-    def forward(self, x):
-        # Initializing hidden state for first input with zeros
-        h0 = torch.zeros(self.layer_dim, x.size(0), self.hidden_dim).requires_grad_()
-
-        # Forward propagation by passing in the input and hidden state into the model
-        out, _ = self.gru(x, h0.detach())
-
-        # Reshaping the outputs in the shape of (batch_size, seq_length, hidden_size)
-        # so that it can fit into the fully connected layer
-        out = out[:, -1, :]
-
-        # Convert the final state to our desired output shape (batch_size, output_dim)
-        out = self.fc(out)
-        return out
-
-    def _get_constructor_parameters(self):
-        data = super()._get_constructor_parameters()
-
-        data.update(
-            dict(
-                input_size=self.input_size,
-                layer_sizes=self.layer_sizes,
-                output_size=self.output_size,
-                lr=self.lr,
-                output_activation=self.output_activation,
-                activation=self.activation,
-                drop_prob=self.drop_prob,
-                device=self.device,
-            )
-        )
-        return data
-
-
 class EpisodeData:
 
     def __init__(self):
@@ -651,6 +502,12 @@ class EpisodeSummary:
         self.done.append(info['is_success'])
         self.reward.append(reward)
 
+    def add_with_no_transformation(self, reward, done, goal_distance, jaw_state):
+        self.reward.append(reward)
+        self.done.append(done)
+        self.goal_distance.append(goal_distance)
+        self.jaw_state.append(jaw_state)
+
     def calc_summary(self):
         return np.mean(self.reward), np.mean(self.done), \
                np.mean(self.goal_distance) if len(self.goal_distance) > 0 else -1, \
@@ -661,187 +518,12 @@ class EpisodeSummary:
         data = EpisodeSummary()
 
         for elem in collected_step_summary:
-            data.add(*elem.calc_summary())
+            data.add_with_no_transformation(*elem.calc_summary())
 
         data_as_dict = data.__dict__
         for key, value in data.__dict__.items():
             data_as_dict[key] = np.mean(value)
         return data_as_dict
-
-
-class SacMaximise:
-
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 - alpha * log_prob_t2.reshape(-1, 1)
-
-            # Determine the batch of bootstrapped estimates of the EFEs:
-            expected_free_energy_estimate_batch = (
-                    reward_batch - pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
-
-        # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 - self.gamma * expected_free_energy_t1
-        return torch.mean(vfe_batch)
-
-
-class SacMinimise:
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 + alpha * log_prob_t2.reshape(-1, 1)
-
-            # Determine the batch of bootstrapped estimates of the EFEs:
-            expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
-
-        # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
-        return torch.mean(vfe_batch)
-
-
-class SacMinimiseEntropy:
-
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 - alpha * log_prob_t2.reshape(-1, 1)
-
-            # Determine the batch of bootstrapped estimates of the EFEs:
-            expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
-
-        # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
-        return torch.mean(vfe_batch)
-
-
-class AdaptedDaif:
-
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            weighted_targets = -log_prob_t2 * target_expected_free_energies_batch_t2
-
-            expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
-
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        # Weigh them according to the action distribution:
-        energy_batch = (-self.gamma * expected_free_energy_t1)
-
-        # Determine the entropy of the action distribution
-        entropy_batch = -pred_log_prob_t1 * alpha
-
-        # Determine the Variable Free Energy, then take the mean over all batch samples:
-        vfe_batch = pred_error_batch_t0t1 + (energy_batch - entropy_batch)
-        vfe = torch.mean(vfe_batch)
-        return vfe
 
 
 class Agent:
@@ -910,31 +592,6 @@ class Agent:
                               lr=config.hparams.value_net_lr,
                               device=self.device)
 
-        self.transition_network_type = config.hparams.transition_network_type
-
-        if self.transition_network_type == 'mlp':
-            self.transition_net = MLP(self.state_size + self.action_dim,
-                                      OmegaConf.to_object(config.hparams.transition_net_layers),
-                                      self.state_size,
-                                      lr=config.hparams.value_net_lr,
-                                      device=self.device)
-            self.transition_preprocessor = TransitionModelMlpPreprocessor(self._preprocess_batch_inputs, self.device)
-        elif self.transition_network_type == 'lstm':
-            self.transition_net = LSTM(self.state_size + self.action_dim,
-                                       OmegaConf.to_object(config.hparams.transition_net_layers),
-                                       self.state_size,
-                                       lr=config.hparams.value_net_lr,
-                                       device=self.device)
-            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs, self.device)
-
-        elif self.transition_network_type == 'gru':
-            self.transition_net = GRU(self.state_size + self.action_dim,
-                                      OmegaConf.to_object(config.hparams.transition_net_layers),
-                                      self.state_size,
-                                      lr=config.hparams.value_net_lr,
-                                      device=self.device)
-            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs, self.device)
-
         # entropy coeff settings
         self.log_alpha = None
         self.alpha_optimizer = None
@@ -946,19 +603,6 @@ class Agent:
             self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=config.hparams.alpha_lr)
         else:
             self.alpha_tensor = torch.tensor(float(self.alpha)).to(self.device)
-
-        if config.hparams.efe_approximation_approach == 'sac_maximize':
-            self.efe_approximation_approach = SacMaximise(self.actor, self.value_net, self.target_net,
-                                                          self.beta, self.gamma)
-        elif config.hparams.efe_approximation_approach == 'sac_minimise':
-            self.efe_approximation_approach = SacMinimise(self.actor, self.value_net, self.target_net,
-                                                          self.beta, self.gamma)
-        elif config.hparams.efe_approximation_approach == 'sac_minimize_entropy':
-            self.efe_approximation_approach = SacMinimiseEntropy(self.actor, self.value_net, self.target_net,
-                                                                 self.beta, self.gamma)
-        elif config.hparams.efe_approximation_approach == 'adapted_daif':
-            self.efe_approximation_approach = AdaptedDaif(self.actor, self.value_net, self.target_net,
-                                                          self.beta, self.gamma)
 
         self.her_module = HERSampler(config.hparams.replay_strategy, config.hparams.replay_k, self.observations_seq_len,
                                      self.env.compute_reward)
@@ -984,7 +628,6 @@ class Agent:
         # just to save model configuration to logs
         self.config_as_dict = OmegaConf.to_object(config.hparams)
         self.config_as_dict['actor_layers'] = str(self.config_as_dict['actor_layers'])
-        self.config_as_dict['transition_net_layers'] = str(self.config_as_dict['transition_net_layers'])
         self.config_as_dict['value_net_layers'] = str(self.config_as_dict['value_net_layers'])
         self.config_as_dict['max_episode_steps'] = str(env._max_episode_steps)
 
@@ -992,7 +635,6 @@ class Agent:
             OmegaConf.save(config, file)
 
     def restore(self):
-        self.transition_net = self.transition_net.load(os.path.join(self.model_path, 'transition_net.pth'), self.device)
         self.actor = self.actor.load(os.path.join(self.model_path, 'actor.pth'), self.device)
         self.value_net = self.value_net.load(os.path.join(self.model_path, 'value_net.pth'), self.device)
         self.target_net.load_state_dict(self.value_net.state_dict(), self.device)
@@ -1021,28 +663,19 @@ class Agent:
         state_batch_t1 = self._preprocess_batch_inputs(observation_batch_t1, desired_goal_batch_t1)
         state_batch_t2 = self._preprocess_batch_inputs(observation_batch_t2, desired_goal_batch_t2)
 
-        transition_net_input = self.transition_preprocessor.preprocess(transition_model_raw_input)
-        pred_batch_t0t1 = self.transition_net(transition_net_input)
-
-        pred_error_batch_t0t1 = torch.mean(
-            F.mse_loss(pred_batch_t0t1, state_batch_t1, reduction='none'), dim=1).unsqueeze(1)
-
         return (state_batch_t1, state_batch_t2,
                 as_tensor(actions_batch_t1, self.device),
                 as_tensor(reward_batch, self.device),
-                as_tensor(done_batch, self.device),
-                pred_error_batch_t0t1)
+                as_tensor(done_batch, self.device))
 
     def _update_network(self):
-        # stable-baseline-3 implementation
-        # We need to sample because `log_std` may have changed between two gradient steps
-        if self.use_sde:
+        if self.actor_action_distribution == 'StateDependentNoiseDistribution':
             self.actor.reset_noise()
 
         # Retrieve transition data in mini batches:
-        (state_batch_t0, state_batch_t1, state_batch_t2,
-         actions_batch_t0, actions_batch_t1, actions_batch_t2,
+        (state_batch_t1, state_batch_t2, actions_batch_t1,
          reward_batch, done_batch) = self.get_mini_batches()
+        # Compute the value network loss:
 
         # Action by the current actor for the sampled state
         actions_pi, log_prob = self.actor.action_log_prob(state_batch_t1)
@@ -1104,12 +737,8 @@ class Agent:
 
         metrics = dict(
             vfe=actor_loss.item(),
-            efe_mse_loss=critic_loss.item(),
-            alpha=alpha.item().detach().item(),
-            predicted_log_prob_t1=log_prob.mean().detach().item(),
-            min_qf_pi=min_qf_pi.mean().detach().item(),
-            next_q_values=next_q_values.mean().detach().item(),
-            next_log_prob=next_log_prob.mean().detach().item(),
+            value_net_loss=critic_loss.item(),
+            alpha=alpha.item(),
         )
         return metrics
 
@@ -1226,7 +855,6 @@ class Agent:
             if self.should_save_model and epoch > 0 and epoch % self.model_save_timer == 0:
                 epoch_path = self.model_path + "/epoch_" + str(epoch)
                 create_dirs([epoch_path])
-                self.transition_net.save(os.path.join(epoch_path, 'transition_net.pth'))
                 self.actor.save(os.path.join(epoch_path, 'actor.pth'))
                 self.value_net.save(os.path.join(epoch_path, 'value_net.pth'))
 
@@ -1246,8 +874,6 @@ class Agent:
 
     def log_models_parameters(self):
         # add histogram of model parameters to the tensorboard
-        for name, p in self.transition_net.named_parameters():
-            self.writer.add_histogram('transition_net_net_' + name, p, bins='auto')
         for name, p in self.actor.named_parameters():
             self.writer.add_histogram('actor_' + name, p, bins='auto')
         for name, p in self.value_net.named_parameters():
@@ -1309,7 +935,7 @@ class Agent:
 
     def warmup(self):
         collected_step_episodes = []
-        for _ in range(self.n_rollout_episodes):
+        for _ in range(self.n_warmap_episodes):
 
             episode_data = EpisodeData()
             observation, achieved_goal, desired_goal, done, reward = self._reset()

@@ -25,7 +25,7 @@ hparams:
 #  sac_minimise
 #  sac_minimize_entropy
 #  adapted_daif
-  efe_approximation_approach: sac_maximize
+  efe_approximation_approach: sac_minimise
 
 #  available values list:
 #  SquashedDiagGaussianDistribution
