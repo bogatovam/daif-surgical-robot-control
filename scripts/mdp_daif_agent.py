@@ -192,7 +192,7 @@ class HERSampler:
 
 
 class Normalizer:
-    def __init__(self, size, eps=1e-2, defau_clip_range=np.inf):
+    def __init__(self, size, eps=1e-2, default_clip_range=np.inf):
         self.size = size
         self.eps = eps
         self.default_clip_range = default_clip_range
