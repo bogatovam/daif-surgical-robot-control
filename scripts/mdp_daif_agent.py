@@ -177,16 +177,19 @@ class HERSampler:
         achieved_goal_batch = achieved_goal_batch.reshape(batch_size, *achieved_goal_batch.shape[1:])
         desired_goal_batch = desired_goal_batch.reshape(batch_size, *desired_goal_batch.shape[1:])
         actions_batch = actions_batch.reshape(batch_size, *actions_batch.shape[1:])
+
+        # Get the achieved_goal at the 'future' timestamps
+        next_achieved_goal = achieved_goal_buffer[:, time:, :][episode_idxs[her_indexes], future_t]
+        next_info_batch = info_buffer[:, time:, :][episode_idxs[her_indexes], future_t]
+        # Replace the 'desired_goal' with the 'next_achieved_goal'
+        desired_goal_batch[her_indexes] = next_achieved_goal
+        info_batch[her_indexes] = next_info_batch
+
         info_batch = info_batch.reshape(batch_size)
         info_batch = {k: [dic[k] for dic in info_batch] for k in info_batch[0]}
 
         for k, v in info_batch.items():
             info_batch[k] = np.expand_dims(np.asarray(v), -1)
-
-        # Get the achieved_goal at the 'future' timestamps
-        next_achieved_goal = achieved_goal_buffer[:, time:, :][episode_idxs[her_indexes], future_t]
-        # Replace the 'desired_goal' with the 'next_achieved_goal'
-        desired_goal_batch[her_indexes] = next_achieved_goal
 
         return observation_batch, achieved_goal_batch, desired_goal_batch, actions_batch, info_batch
 
