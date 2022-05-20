@@ -1,4 +1,4 @@
-experiment_name: NeedleGrasp-v0-daif-rnn--6-v0
+experiment_name: temp
 experiment_description: "test mdp sac with this task"
 
 monitor_file: logs\{experiment_name}\monitor.csv

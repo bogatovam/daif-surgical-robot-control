@@ -51,4 +51,5 @@ vae:
     batch_size: 4
     image_shape: [64, 64, 3]
     vae_seq_len: 4
+    vae_n_latent_dims: 64
 

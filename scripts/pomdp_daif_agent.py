@@ -307,7 +307,9 @@ class ReplayBuffer:
         self.desired_goal_memory[ids] = desired_goal
         self.actions_memory[ids] = action
         self.info_memory[ids] = np.expand_dims(info, -1)
-        self.priority_memory[ids] = np.repeat(self.priority_memory.max(), self.max_episode_steps)
+        self.priority_memory[ids] = np.reshape(np.repeat(self.priority_memory.max(),
+                                                         self.max_episode_steps * n_episodes_to_store),
+                                               newshape=(n_episodes_to_store, self.max_episode_steps, 1))
 
         self.n_transitions_stored += self.max_episode_steps * n_episodes_to_store
 
@@ -660,7 +662,6 @@ class Actor(BasePolicy):
         self.action_dist.sample_weights(self.log_std, batch_size=batch_size)
 
     def get_action_dist_params(self, observations: torch.Tensor):
-        # features = self.extract_features(observations)
         latent_pi = self.latent_pi(observations)
         mean_actions = self.mu(latent_pi)
 
@@ -731,9 +732,9 @@ class TransitionModelMlpPreprocessor:
 
         time_vae_images = np.asarray(time_vae_images)  # (self.vae_seq_len, batch, image.h, image.w, 3)
         time_vae_images = np.reshape(time_vae_images,
-                                     share=(self.batch_size,
-                                            3, self.image_shape[0], self.image_shape[1],
-                                            self.vae_seq_len))
+                                     newshape=(self.batch_size,
+                                               3, self.image_shape[0], self.image_shape[1],
+                                               self.vae_seq_len))
 
         state_batch = self.preprocess_func(np.asarray(time_vae_images)).detach()
         return torch.cat((state_batch, as_tensor(actions_batch, self.device)), dim=1)
@@ -761,9 +762,9 @@ class TransitionModelRnnPreprocessor:
 
             time_vae_images = np.asarray(time_vae_images)  # (self.vae_seq_len, batch, image.h, image.w, 3)
             time_vae_images = np.reshape(time_vae_images,
-                                         share=(self.batch_size,
-                                                3, self.image_shape[0], self.image_shape[1],
-                                                self.vae_seq_len))
+                                         newshape=(self.batch_size,
+                                                   3, self.image_shape[0], self.image_shape[1],
+                                                   self.vae_seq_len))
 
             state_batch = self.preprocess_func(time_vae_images).detach()
             final_batch.append(torch.cat((state_batch, as_tensor(actions_batch, self.device)), dim=1))
@@ -968,48 +969,6 @@ class EpisodeSummary:
         return data_as_dict
 
 
-class SacMinimise:
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 + alpha * log_prob_t2.reshape(-1, 1)
-
-            # Determine the batch of bootstrapped estimates of the EFEs:
-            expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1.0 - done_batch) * self.beta * weighted_targets)
-
-        # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha, vae_loss):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        vfe_batch = vae_loss + pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
-        return torch.mean(vfe_batch)
-
-
 class Agent:
     def __init__(self, env, config):
         self.env = env
@@ -1057,51 +1016,72 @@ class Agent:
 
         assert (self.n_rollout_episodes >= self.observations_seq_len)
         assert (self.n_warmap_episodes >= self.observations_seq_len)
-        self.images_vae = BetaVAE(3, 64, vae_lr=config.hparams.vae_lr, device=self.device)
+        self.images_vae = BetaVAE(3, config.vae.hparams.vae_n_latent_dims, vae_lr=config.hparams.vae_lr,
+                                  device=self.device)
 
         self.current_epoch = 0
+
+        self.vae_n_latent_dims = config.vae.hparams.vae_n_latent_dims
+        self.latent_state_shape = self.vae_n_latent_dims * 2
         self.actor = Actor(env.observation_space, env.action_space,
-                           self.state_size,
+                           self.latent_state_shape,
                            OmegaConf.to_object(config.hparams.actor_layers),
                            action_distribution_type=self.actor_action_distribution,
                            lr=config.hparams.actor_lr,
                            device=self.device)
 
-        self.value_net = MLP(self.state_size + self.action_dim,
+        self.value_net = MLP(self.latent_state_shape + self.action_dim,
                              OmegaConf.to_object(config.hparams.value_net_layers),
                              1,
                              lr=config.hparams.value_net_lr,
                              device=self.device)
-        self.target_net = MLP(self.state_size + self.action_dim,
+        self.target_net = MLP(self.latent_state_shape + self.action_dim,
                               OmegaConf.to_object(config.hparams.value_net_layers),
                               1,
                               lr=config.hparams.value_net_lr,
                               device=self.device)
 
+        self.rnn_seq_len = config.hparams.observations_seq_len
+        self.vae_seq_len = config.vae.hparams.vae_seq_len
         self.transition_network_type = config.hparams.transition_network_type
 
         if self.transition_network_type == 'mlp':
-            self.transition_net = MLP(self.state_size + self.action_dim,
+            self.transition_net = MLP(self.latent_state_shape + self.action_dim,
                                       OmegaConf.to_object(config.hparams.transition_net_layers),
-                                      self.state_size,
+                                      self.latent_state_shape,
                                       lr=config.hparams.value_net_lr,
                                       device=self.device)
-            self.transition_preprocessor = TransitionModelMlpPreprocessor(self._preprocess_batch_inputs, self.device)
+            self.transition_preprocessor = TransitionModelMlpPreprocessor(self._preprocess_batch_inputs,
+                                                                          rnn_seq_len=self.rnn_seq_len,
+                                                                          vae_seq_len=self.vae_seq_len,
+                                                                          device=self.device,
+                                                                          image_shape=self.image_shape,
+                                                                          batch_size=self.batch_size)
         elif self.transition_network_type == 'lstm':
-            self.transition_net = LSTM(self.state_size + self.action_dim,
+            self.transition_net = LSTM(self.latent_state_shape + self.action_dim,
                                        OmegaConf.to_object(config.hparams.transition_net_layers),
-                                       self.state_size,
+                                       self.latent_state_shape,
                                        lr=config.hparams.value_net_lr,
                                        device=self.device)
-            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs, self.device)
+            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs,
+                                                                          rnn_seq_len=self.rnn_seq_len,
+                                                                          vae_seq_len=self.vae_seq_len,
+                                                                          device=self.device,
+                                                                          image_shape=self.image_shape,
+                                                                          batch_size=self.batch_size)
 
         elif self.transition_network_type == 'gru':
-            self.transition_net = GRU(self.state_size + self.action_dim,
+            self.transition_net = GRU(self.latent_state_shape + self.action_dim,
                                       OmegaConf.to_object(config.hparams.transition_net_layers),
-                                      self.state_size,
+                                      self.latent_state_shape,
                                       lr=config.hparams.value_net_lr,
                                       device=self.device)
-            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs, self.device)
+            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs,
+                                                                          rnn_seq_len=self.rnn_seq_len,
+                                                                          vae_seq_len=self.vae_seq_len,
+                                                                          device=self.device,
+                                                                          image_shape=self.image_shape,
+                                                                          batch_size=self.batch_size)
 
         # entropy coeff settings
         self.log_alpha = None
@@ -1115,20 +1095,16 @@ class Agent:
         else:
             self.alpha_tensor = torch.tensor(float(self.alpha)).to(self.device)
 
-        if config.hparams.efe_approximation_approach == 'sac_minimise':
-            self.efe_approximation_approach = SacMinimise(self.actor, self.value_net, self.target_net,
-                                                          self.beta, self.gamma)
-
         self.vae_seq_len = config.vae.hparams.vae_seq_len  # The discount rate
         self.rnn_seq_len = config.hparams.observations_seq_len  # The discount rate
 
-        self.prioritized = config.prioritized
+        self.prioritized = config.hparams.prioritized
         self.sampler = SimpleSampler(self.vae_seq_len, self.rnn_seq_len,
                                      self.env.compute_reward, config.seed,
                                      self.prioritized, 0.4)
         # create the replay buffer
         self.buffer = ReplayBuffer(self.env, self._max_episode_steps, self.memory_capacity,
-                                   self.sampler.sample_transitions, config.device_id)
+                                   self.sampler.sample_transitions, config.device_id, self.image_shape)
 
         self.o_norm = Normalizer(size=env.observation_space.spaces['observation'].shape[0])
         self.g_norm = Normalizer(size=env.observation_space.spaces['desired_goal'].shape[0])
@@ -1143,7 +1119,7 @@ class Agent:
 
         self.train_metrics = MetricTracker('vfe', 'value_net_loss', 'alpha', 'alpha_loss', 'success_rate', 'reward',
                                            'transition_net_grad', 'actor_grad_acc', 'value_net_grad',
-                                           'sde_std', 'transition_net_loss', 'goal_distance', 'jaw_state',
+                                           'sde_std', 'transition_net_loss', 'goal_distance', 'jaw_state', 'vae_loss',
                                            writer=self.writer)
 
         self.val_metrics = MetricTracker('val/success_rate', 'val/reward', writer=self.writer)
@@ -1182,11 +1158,10 @@ class Agent:
 
         transition_model_raw_input, t1, t2 = sequential_batches[:-2], sequential_batches[-2], sequential_batches[-1]
 
-        (_, img_batch_t1, _, _, actions_batch_t1, _) = t1
-        (_, img_batch_t2, _, _, actions_batch_t2, _) = t2
+        (_, _, _, _, actions_batch_t1, _) = t1
+        (_, _, _, _, actions_batch_t2, _) = t2
 
-        img_batch_t1 = as_tensor(img_batch_t1, self.device)
-        img_batch_t2 = as_tensor(img_batch_t2, self.device)
+        img_batch_t1, img_batch_t2 = self.get_encoder_input(sequential_batches)
 
         mu_batch_t1, logvar_batch_t1 = self.images_vae.encode(img_batch_t1)
         mu_batch_t2, logvar_batch_t2 = self.images_vae.encode(img_batch_t2)
@@ -1200,7 +1175,6 @@ class Agent:
         pred_error_batch_t0t1 = torch.mean(
             F.mse_loss(pred_batch_t0t1, state_batch_t1, reduction='none'), dim=1).unsqueeze(1)
 
-        # Reparameterize the distribution over states for time t1
         z_batch_t1 = self.images_vae.reparameterize(mu_batch_t1, logvar_batch_t1)
 
         return (state_batch_t1, state_batch_t2,
@@ -1210,7 +1184,41 @@ class Agent:
                 pred_error_batch_t0t1, z_batch_t1,
                 img_batch_t1, mu_batch_t1, logvar_batch_t1)
 
+    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
+                               actions_batch_t1,
+                               reward_batch, done_batch,
+                               pred_error_batch_t0t1, alpha):
+        with torch.no_grad():
+            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
+
+            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
+            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
+
+            # H_t2 ~ -log_prob_t2
+            weighted_targets = target_expected_free_energies_batch_t2 + alpha * log_prob_t2.reshape(-1, 1)
+
+            # Determine the batch of bootstrapped estimates of the EFEs:
+            expected_free_energy_estimate_batch = (
+                    -reward_batch + pred_error_batch_t0t1 + (1.0 - done_batch) * self.beta * weighted_targets)
+
+        # Determine the Expected free energy at time t1 according to the value network:
+        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
+        value_net_output_t1 = self.value_net(value_net_input_t1)
+
+        # Determine the MSE loss between the EFE estimates and the value network output:
+        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
+        return mse
+
+    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
+                                        pred_error_batch_t0t1, alpha, vae_loss):
+        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
+        expected_free_energy_t1 = self.value_net(value_net_input)
+
+        vfe_batch = vae_loss + pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
+        return torch.mean(vfe_batch)
+
     def _update_network(self):
+
         if self.actor_action_distribution == 'StateDependentNoiseDistribution':
             self.actor.reset_noise()
 
@@ -1245,11 +1253,9 @@ class Agent:
         recon_batch = self.images_vae.decode(z_batch_t1)
         vae_loss = self.images_vae.loss_function(recon_batch, encoder_input_t1, mu_t1, logvar_t1, M_N=0.00025)
 
-        value_net_loss = self.efe_approximation_approach.compute_value_net_loss(state_batch_t1, state_batch_t2,
-                                                                                actions_batch_t1,
-                                                                                reward_batch, done_batch,
-                                                                                pred_error_batch_t0t1,
-                                                                                alpha)
+        value_net_loss = self.compute_value_net_loss(state_batch_t1.detach(), state_batch_t2.detach(), actions_batch_t1,
+                                                     reward_batch, done_batch, pred_error_batch_t0t1, alpha)
+
         self.transition_net.optimizer.zero_grad()
         self.images_vae.optimizer.zero_grad()
 
@@ -1257,14 +1263,10 @@ class Agent:
         value_net_loss.backward()
         self.value_net.optimizer.step()
 
-        # Optimize the actor
         self.actor.optimizer.zero_grad()
-        # Compute the variational free energy:
-        vfe = self.efe_approximation_approach.compute_variational_free_energy(state_batch_t1.detach(),
-                                                                              sampled_actions_t1,
-                                                                              sampled_actions_log_prob_t1,
-                                                                              pred_error_batch_t0t1, alpha,
-                                                                              vae_loss)
+        vfe = self.compute_variational_free_energy(state_batch_t1.detach(), sampled_actions_t1,
+                                                   sampled_actions_log_prob_t1, pred_error_batch_t0t1, alpha, vae_loss)
+
         vfe.backward()
         self.actor.optimizer.step()
         self.transition_net.optimizer.step()
@@ -1320,7 +1322,7 @@ class Agent:
         self.writer.add_text(self.experiment_name, self.experiment_description)
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
-        self.warmup()
+        # self.warmup()
         for epoch in range(self.current_epoch, self.n_epochs + 1):
             for cycle in range(self.steps_per_epoch):
                 step = self.steps_per_epoch * epoch + cycle
@@ -1338,7 +1340,7 @@ class Agent:
                         last_obs = episode_data.get_last_obs(self.vae_seq_len - 1)
                         input_tensor = self._preprocess_inputs(last_obs, image_obs).detach()
 
-                        action = self._select_action(input_tensor).detach()
+                        action = self._select_action(input_tensor)
 
                         # feed the actions into the environment
                         new_observation, reward, _, info = self.env.step(action)
@@ -1453,26 +1455,29 @@ class Agent:
         vae_input = np.expand_dims(observation, 0)
         vae_input = np.repeat(vae_input, self.vae_seq_len - len(last_n_obs), axis=0)
 
-        vae_input_tensor = np.concatenate([last_n_obs, vae_input], axis=0)
+        if last_n_obs.size == 0:
+            vae_input_tensor = vae_input
+        else:
+            vae_input_tensor = np.concatenate([last_n_obs, vae_input], axis=0)
+
         vae_input_tensor = as_tensor(vae_input_tensor, self.device)
         vae_input_tensor = vae_input_tensor.view(1, 3, self.image_shape[0], self.image_shape[1], self.vae_seq_len)
 
         state_mu, state_logvar = self.images_vae.encode(vae_input_tensor)
         return torch.cat((state_mu, state_logvar), dim=1)
 
-    def _preprocess_batch_inputs(self, last_n_obs, observation):
-        vae_input_tensor = np.concatenate([last_n_obs, observation], axis=1)
-        vae_input_tensor = as_tensor(vae_input_tensor, self.device)
-        vae_input_tensor = vae_input_tensor.view(observation.size, 3, self.image_shape[0], self.image_shape[1],
+    def _preprocess_batch_inputs(self, observation):
+        vae_input_tensor = as_tensor(observation, self.device)
+        vae_input_tensor = vae_input_tensor.view(observation.shape[0], 3, self.image_shape[0], self.image_shape[1],
                                                  self.vae_seq_len)
         state_mu, state_logvar = self.images_vae.encode(vae_input_tensor)
         return torch.cat((state_mu, state_logvar), dim=1)
 
     def _get_normalized_image_from_env(self):
-        original_image = self.env.render(mode='rgb_array')
+        original_image = self.env.render(mode='rgb_array', width=self.image_shape[0], height=self.image_shape[1])
         image_obs = np.resize(original_image.astype(np.float32), self.image_shape)
         image_obs /= 255
-        return image_obs
+        return image_obs, original_image
 
     def warmup(self):
         collected_step_episodes = []
@@ -1504,6 +1509,27 @@ class Agent:
 
         # store the episodes
         self.buffer.store_episode(**collected_step_episodes, n_episodes_to_store=self.n_warmap_episodes)
+
+    def get_encoder_input(self, sequence_of_batches):
+        final_batch = []
+        for time in reversed(range(2)):
+            (_, _, _, _, actions_batch, _) = sequence_of_batches[-time]
+
+            time_vae_images = []
+            for vae_time in reversed(range(self.vae_seq_len)):
+                (_, images, _, _, _, _) = sequence_of_batches[-time - vae_time]
+                time_vae_images.append(images)
+
+            time_vae_images = np.asarray(time_vae_images)  # (self.vae_seq_len, batch, image.h, image.w, 3)
+            time_vae_images = np.reshape(time_vae_images,
+                                         newshape=(actions_batch.shape[0],
+                                                   3, self.image_shape[0], self.image_shape[1],
+                                                   self.vae_seq_len))
+
+            time_vae_images_tensor = as_tensor(time_vae_images, self.device)
+            final_batch.append(time_vae_images_tensor)
+
+        return final_batch[0], final_batch[1]
 
 
 def make_env(config):
