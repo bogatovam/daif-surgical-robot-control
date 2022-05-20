@@ -1,8 +1,5 @@
-experiment_name: NeedleReach-daif-rnn--7-v0
+experiment_name: NeedleGrasp-v0-daif-rnn--6-v0
 experiment_description: "test mdp sac with this task"
-
-#experiment_name: efe-as-sac-v15
-#experiment_description: "use true alg"
 
 monitor_file: logs\{experiment_name}\monitor.csv
 tb_log_folder: logs\tensorboard\{experiment_name}
@@ -16,7 +13,7 @@ hparams:
   n_warmap_episodes: 50
 
 should_save_model: true
-model_path: models\efe-as-sac-v17\epoch_49
+model_path: models\{experiment_name}
 model_save_timer: 10
 
 

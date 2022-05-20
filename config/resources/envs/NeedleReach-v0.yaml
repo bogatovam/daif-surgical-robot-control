@@ -5,16 +5,18 @@ hparams:
 # HER
   replay_strategy: future
   replay_k: 4
+  prioritized: false
 
 #  Networks
   actor_layers:  [128, 256, 128]
-  transition_net_layers: [128, 256, 128]
+  transition_net_layers: [128, 128, 128]
   value_net_layers: [128, 256, 128]
 
   actor_lr: 0.0003
-  transition_net_lr: 0.0003
+  transition_net_lr: 0.00005
   value_net_lr: 0.0003
   alpha_lr: 0.0003
+  vae_lr: 0.00005
 
   alpha: auto
   gamma: 1.00
@@ -36,20 +38,17 @@ hparams:
 #  mlp
 #  gru
 #  lstm
-  transition_network_type: lstm
+  transition_network_type: mlp
 
-#  available values list:
-# Disentangled Beta-VAE
-# LogCosh
-# original
   vae_type: original
-  observations_seq_len: 7 # default 3
+  observations_seq_len: 4 # default 3
+  vae_pretrained_path: pretrained-vae/NeedleReach-beta.pth
 
 vae:
   tb_log_folder: logs\vae\tensorboard\{experiment_name}
   hparams:
     memory_capacity: 50000
     batch_size: 4
-    image_shape: [32, 32, 3]
-    vae_seq_len: 4 # fixed, dont change
+    image_shape: [64, 64, 3]
+    vae_seq_len: 4
 

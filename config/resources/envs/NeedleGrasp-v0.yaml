@@ -25,7 +25,7 @@ hparams:
 #  sac_minimise
 #  sac_minimize_entropy
 #  adapted_daif
-  efe_approximation_approach: sac_minimise
+  efe_approximation_approach: sac_maximize
 
 #  available values list:
 #  SquashedDiagGaussianDistribution
@@ -36,14 +36,14 @@ hparams:
 #  mlp
 #  gru
 #  lstm
-  transition_network_type: lstm
+  transition_network_type: gru
 
 #  available values list:
 # Disentangled Beta-VAE
 # LogCosh
 # original
   vae_type: LogCosh
-  observations_seq_len: 8 # default 3
+  observations_seq_len: 6 # default 3
 
 vae:
   tb_log_folder: logs\vae\tensorboard\{experiment_name}

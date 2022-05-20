@@ -465,7 +465,7 @@ class TransitionModelMlpPreprocessor:
         self.device = device
 
     def preprocess(self, sequence_of_batches):
-        (observation_batch, _, desired_goal_batch, actions_batch_t0, _) = sequence_of_batches[0]
+        (observation_batch, _, desired_goal_batch, actions_batch_t0, _) = sequence_of_batches[-1]
         state_batch_t0 = self.preprocess_func(observation_batch, desired_goal_batch)
         return torch.cat((state_batch_t0, as_tensor(actions_batch_t0, self.device)), dim=1)
 
@@ -709,7 +709,7 @@ class SacMaximise:
         value_net_output_t1 = self.value_net(value_net_input_t1)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
+        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
         return mse
 
     def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
@@ -751,7 +751,7 @@ class SacMinimise:
         value_net_output_t1 = self.value_net(value_net_input_t1)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
+        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
         return mse
 
     def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
@@ -794,7 +794,7 @@ class SacMinimiseEntropy:
         value_net_output_t1 = self.value_net(value_net_input_t1)
 
         # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
+        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
         return mse
 
     def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
@@ -833,7 +833,7 @@ class AdaptedDaif:
         value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
         value_net_output_t1 = self.value_net(value_net_input_t1)
 
-        mse = 0.5 * F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
+        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
         return mse
 
     def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
@@ -989,13 +989,6 @@ class Agent:
                                            writer=self.writer)
 
         self.val_metrics = MetricTracker('val/success_rate', 'val/reward', writer=self.writer)
-
-        # just to save model configuration to logs
-        self.config_as_dict = OmegaConf.to_object(config.hparams)
-        self.config_as_dict['actor_layers'] = str(self.config_as_dict['actor_layers'])
-        self.config_as_dict['transition_net_layers'] = str(self.config_as_dict['transition_net_layers'])
-        self.config_as_dict['value_net_layers'] = str(self.config_as_dict['value_net_layers'])
-        self.config_as_dict['max_episode_steps'] = str(env._max_episode_steps)
 
         with open(os.path.join(self.model_path, "config.yaml"), 'w+') as file:
             OmegaConf.save(config, file)
@@ -1412,4 +1405,4 @@ def train_agent_according_config(config):
 
 
 if __name__ == '__main__':
-    train_agent_according_config(get_config(env_id='NeedleReach-v0', device='cpu'))
+    train_agent_according_config(get_config(env_id='NeedleGrasp-v0', device='cpu'))
