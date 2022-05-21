@@ -43,7 +43,7 @@ hparams:
 # LogCosh
 # original
   vae_type: LogCosh
-  observations_seq_len: 6 # default 3
+  rnn_seq_len: 6 # default 3
 
 vae:
   tb_log_folder: logs\vae\tensorboard\{experiment_name}

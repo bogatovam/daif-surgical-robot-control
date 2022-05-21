@@ -101,7 +101,7 @@ class ReplayBuffer:
 
 
 class HERSampler:
-    def __init__(self, replay_strategy, replay_k, seq_len, reward_func=None):
+    def __init__(self, replay_strategy, replay_k, rnn_seq_len, reward_func=None):
         self.replay_strategy = replay_strategy
         self.replay_k = replay_k
         if self.replay_strategy == 'future':
@@ -109,7 +109,8 @@ class HERSampler:
         else:
             self.future_p = 0
         self.reward_func = reward_func
-        self.seq_len = seq_len
+        self.rnn_seq_len = rnn_seq_len
+        self.total_seq_len = rnn_seq_len + 2
 
     def sample_her_transitions(self, observation_buffer,
                                achieved_goal_buffer, desired_goal_buffer,
@@ -125,18 +126,18 @@ class HERSampler:
 
         # generate ids which timestamps to use
         # - 2 because we sample for 3 sequential timestamps
-        t_samples = np.random.randint(low=0, high=trajectory_length - self.seq_len, size=batch_size)
+        t_samples = np.random.randint(low=0, high=trajectory_length - self.total_seq_len, size=batch_size)
 
         # her idx
         her_indexes = np.where(np.random.uniform(size=batch_size) < self.future_p)
 
         # Sample 'future' timestamps for each 't_samples'
-        future_offset = np.random.uniform(size=batch_size) * (trajectory_length - self.seq_len - t_samples)
+        future_offset = np.random.uniform(size=batch_size) * (trajectory_length - self.total_seq_len - t_samples)
         future_offset = future_offset.astype(int)
         future_t = (t_samples + future_offset)[her_indexes]
 
         sequential_batches = []
-        for time_i in range(self.seq_len):
+        for time_i in range(self.total_seq_len):
             t_i = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
                                         info_buffer,
                                         episode_ids, t_samples, her_indexes, future_t,
@@ -895,10 +896,10 @@ class Agent:
 
         self.actions_shape = self.env.action_space.shape
         self.action_dim = self.env.action_space.shape[-1]
-        self.observations_seq_len = config.hparams.observations_seq_len  # The discount rate
+        self.rnn_seq_len = config.hparams.rnn_seq_len  # The discount rate
 
-        assert (self.n_rollout_episodes >= self.observations_seq_len)
-        assert (self.n_warmap_episodes >= self.observations_seq_len)
+        assert (self.n_rollout_episodes >= self.rnn_seq_len)
+        assert (self.n_warmap_episodes >= self.rnn_seq_len)
 
         self.current_epoch = 0
         self.actor = Actor(env.observation_space, env.action_space,
@@ -969,7 +970,7 @@ class Agent:
             self.efe_approximation_approach = AdaptedDaif(self.actor, self.value_net, self.target_net,
                                                           self.beta, self.gamma)
 
-        self.her_module = HERSampler(config.hparams.replay_strategy, config.hparams.replay_k, self.observations_seq_len,
+        self.her_module = HERSampler(config.hparams.replay_strategy, config.hparams.replay_k, self.rnn_seq_len,
                                      self.env.compute_reward)
         # create the replay buffer
         self.buffer = ReplayBuffer(self.env, self._max_episode_steps, self.memory_capacity,

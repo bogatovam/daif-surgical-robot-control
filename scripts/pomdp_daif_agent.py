@@ -1,14 +1,13 @@
 import copy
 import os.path
-from abc import abstractmethod, ABC
-from typing import Tuple, Optional, NamedTuple, List, Any
+from abc import ABC
+from typing import Tuple, List, Any
 
 from stable_baselines3.common.utils import polyak_update
 
 import surrol.gym as surrol_gym
 from omegaconf import OmegaConf
-from stable_baselines3.common.distributions import StateDependentNoiseDistribution, \
-    TanhBijector, DiagGaussianDistribution, SquashedDiagGaussianDistribution
+from stable_baselines3.common.distributions import StateDependentNoiseDistribution, SquashedDiagGaussianDistribution
 from stable_baselines3.common.preprocessing import get_action_dim, is_image_space, maybe_transpose
 from stable_baselines3.common.torch_layers import create_mlp
 
@@ -22,19 +21,9 @@ from utils import MetricTracker, create_dirs
 from datetime import datetime
 import os.path
 
-import gym
-
 import os.path
 import random
 import sys
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-
-import gym
-
-import threading
 import numpy as np
 import imageio
 import gym
@@ -294,7 +283,7 @@ class ReplayBuffer:
         self.priority_memory = np.ones([self.size, self.max_episode_steps, 1], dtype=np.float32)
 
     def update_priorities(self, episode_idx, time_idx, priorities):
-        self.priority_memory[episode_idx, time_idx] = abs(priorities)
+        self.priority_memory[episode_idx, time_idx] = np.expand_dims(abs(priorities), 1)
 
     # store the episode
     def store_episode(self, observation, image_observation, achieved_goal, desired_goal, action, info,
@@ -314,7 +303,7 @@ class ReplayBuffer:
         self.n_transitions_stored += self.max_episode_steps * n_episodes_to_store
 
     # sample the data from the replay buffer
-    def sample(self, batch_size):
+    def sample(self, batch_size, current_episode):
         observation_image_buffer = self.observation_image_memory[:self.current_size]
         observation_buffer = self.observation_memory[:self.current_size]
         achieved_goal_buffer = self.achieved_goal_memory[:self.current_size]
@@ -327,7 +316,7 @@ class ReplayBuffer:
                                 observation_image_buffer,
                                 achieved_goal_buffer, desired_goal_buffer,
                                 actions_buffer, info_buffer, priorities_buffer,
-                                batch_size)
+                                batch_size, current_episode)
 
     def _get_storage_idx(self, inc=None):
         inc = inc or 1
@@ -346,6 +335,10 @@ class ReplayBuffer:
         return idx
 
 
+def exponential_annealing_schedule(n, rate):
+    return 1 - np.exp(-rate * n)
+
+
 class SimpleSampler:
     def __init__(self, rnn_seq_len, vae_seq_len, reward_func, seed, prioritized=False, alpha: float = 0.0):
         self.rnn_seq_len = rnn_seq_len
@@ -354,11 +347,12 @@ class SimpleSampler:
         self.prioritized = prioritized
         self._alpha = alpha
         self.reward_func = reward_func
+        self.beta_schedule = lambda n: exponential_annealing_schedule(n, 1e-2)
         self._random_state = np.random.RandomState(seed)
 
     def sample_transitions(self, observation_buffer, observation_image_buffer,
                            achieved_goal_buffer, desired_goal_buffer,
-                           actions_buffer, info_buffer, priorities, batch_size):
+                           actions_buffer, info_buffer, priorities, batch_size, current_episode):
         # Trajectory length
         trajectory_length = actions_buffer.shape[1] - self.total_seq_len
 
@@ -370,7 +364,7 @@ class SimpleSampler:
             episode_priorities = np.mean(priorities, axis=1)
             sampling_probs = episode_priorities ** self._alpha / np.sum(episode_priorities ** self._alpha)
             episode_ids = self._random_state.choice(np.arange(buffer_length), size=batch_size,
-                                                    replace=True, p=sampling_probs)
+                                                    replace=True, p=np.squeeze(sampling_probs))
         else:
             episode_ids = np.random.randint(low=0, high=buffer_length, size=batch_size)
 
@@ -379,26 +373,19 @@ class SimpleSampler:
         weights = None
         t_samples = None
         if self.prioritized:
+            beta = self.beta_schedule(current_episode)
             weights = np.zeros(shape=batch_size)
             time_priorities = priorities[episode_ids]
-            t_samples = np.zeros(shape=batch_size)
+            t_samples = np.zeros(shape=batch_size, dtype=int)
             for i in range(batch_size):
-                sampling_probs = time_priorities[i] ** self._alpha / np.sum(time_priorities[i] ** self._alpha)
+                sampling_probs = (time_priorities[i][:trajectory_length] ** self._alpha / np.sum(
+                    time_priorities[i][:trajectory_length] ** self._alpha))
                 t_samples[i] = self._random_state.choice(np.arange(trajectory_length), size=1,
-                                                         replace=True, p=sampling_probs)
-                weights[i] = (buffer_length * sampling_probs[t_samples[i]]) ** -(1e-2)
+                                                         replace=True, p=np.squeeze(sampling_probs)).astype(int)
+                weights[i] = (buffer_length * sampling_probs[t_samples[i]]) ** (-beta)
             weights = weights / weights.max()
         else:
-            t_samples = np.random.randint(low=0, high=trajectory_length - self.total_seq_len, size=batch_size)
-
-        weights = None
-        if self.prioritized:
-            time_priorities = priorities[episode_ids]
-            t_samples = np.zeros(shape=batch_size)
-            for i in range(batch_size):
-                sampling_probs = time_priorities[i] ** self._alpha / np.sum(time_priorities[i] ** self._alpha)
-                t_samples[i] = self._random_state.choice(np.arange(trajectory_length), size=1,
-                                                         replace=True, p=sampling_probs)
+            t_samples = np.random.randint(low=0, high=trajectory_length, size=batch_size)
 
         sequential_batches = []
         for time_i in range(self.total_seq_len):
@@ -1012,14 +999,24 @@ class Agent:
 
         self.actions_shape = self.env.action_space.shape
         self.action_dim = self.env.action_space.shape[-1]
-        self.observations_seq_len = config.hparams.observations_seq_len  # The discount rate
+        self.rnn_seq_len = config.hparams.rnn_seq_len  # The discount rate
+        self.rnn_seq_len = config.hparams.rnn_seq_len
+        self.vae_seq_len = config.vae.hparams.vae_seq_len
 
-        assert (self.n_rollout_episodes >= self.observations_seq_len)
-        assert (self.n_warmap_episodes >= self.observations_seq_len)
+        assert (self.n_rollout_episodes >= self.rnn_seq_len)
+        assert (self.n_warmap_episodes >= self.rnn_seq_len)
         self.images_vae = BetaVAE(3, config.vae.hparams.vae_n_latent_dims, vae_lr=config.hparams.vae_lr,
                                   device=self.device)
 
         self.current_epoch = 0
+
+        self.prioritized = config.hparams.prioritized
+        self.sampler = SimpleSampler(self.vae_seq_len, self.rnn_seq_len,
+                                     self.env.compute_reward, config.seed,
+                                     self.prioritized, 0.4)
+        # create the replay buffer
+        self.buffer = ReplayBuffer(self.env, self._max_episode_steps, self.memory_capacity,
+                                   self.sampler.sample_transitions, config.device_id, self.image_shape)
 
         self.vae_n_latent_dims = config.vae.hparams.vae_n_latent_dims
         self.latent_state_shape = self.vae_n_latent_dims * 2
@@ -1030,19 +1027,20 @@ class Agent:
                            lr=config.hparams.actor_lr,
                            device=self.device)
 
+        # Value Net config
         self.value_net = MLP(self.latent_state_shape + self.action_dim,
                              OmegaConf.to_object(config.hparams.value_net_layers),
                              1,
                              lr=config.hparams.value_net_lr,
                              device=self.device)
+
+        self.target_update_interval = 1
         self.target_net = MLP(self.latent_state_shape + self.action_dim,
                               OmegaConf.to_object(config.hparams.value_net_layers),
                               1,
                               lr=config.hparams.value_net_lr,
                               device=self.device)
 
-        self.rnn_seq_len = config.hparams.observations_seq_len
-        self.vae_seq_len = config.vae.hparams.vae_seq_len
         self.transition_network_type = config.hparams.transition_network_type
 
         if self.transition_network_type == 'mlp':
@@ -1095,22 +1093,6 @@ class Agent:
         else:
             self.alpha_tensor = torch.tensor(float(self.alpha)).to(self.device)
 
-        self.vae_seq_len = config.vae.hparams.vae_seq_len  # The discount rate
-        self.rnn_seq_len = config.hparams.observations_seq_len  # The discount rate
-
-        self.prioritized = config.hparams.prioritized
-        self.sampler = SimpleSampler(self.vae_seq_len, self.rnn_seq_len,
-                                     self.env.compute_reward, config.seed,
-                                     self.prioritized, 0.4)
-        # create the replay buffer
-        self.buffer = ReplayBuffer(self.env, self._max_episode_steps, self.memory_capacity,
-                                   self.sampler.sample_transitions, config.device_id, self.image_shape)
-
-        self.o_norm = Normalizer(size=env.observation_space.spaces['observation'].shape[0])
-        self.g_norm = Normalizer(size=env.observation_space.spaces['desired_goal'].shape[0])
-        self.a_norm = Normalizer(size=self.action_dim)
-        self.target_update_interval = 1
-
         self.vae_pretrained_path = prepare_path(config.hparams.vae_pretrained_path)
         self.images_vae = self.images_vae.load(self.vae_pretrained_path, self.device)
 
@@ -1125,12 +1107,6 @@ class Agent:
         self.val_metrics = MetricTracker('val/success_rate', 'val/reward', writer=self.writer)
 
         # just to save model configuration to logs
-        self.config_as_dict = OmegaConf.to_object(config.hparams)
-        self.config_as_dict['actor_layers'] = str(self.config_as_dict['actor_layers'])
-        self.config_as_dict['transition_net_layers'] = str(self.config_as_dict['transition_net_layers'])
-        self.config_as_dict['value_net_layers'] = str(self.config_as_dict['value_net_layers'])
-        self.config_as_dict['max_episode_steps'] = str(env._max_episode_steps)
-
         with open(os.path.join(self.model_path, "config.yaml"), 'w+') as file:
             OmegaConf.save(config, file)
 
@@ -1153,8 +1129,9 @@ class Agent:
             saved_alpha_tensor = torch.load(os.path.join(self.model_path, 'alpha_tensor.pt'))
             self.alpha_tensor = saved_alpha_tensor
 
-    def get_mini_batches(self):
-        (sequential_batches, reward_batch, done_batch, ids, _) = self.buffer.sample(self.batch_size)
+    def get_mini_batches(self, current_episode):
+        (sequential_batches, reward_batch, done_batch, ids, weights) = self.buffer.sample(self.batch_size,
+                                                                                          current_episode)
 
         transition_model_raw_input, t1, t2 = sequential_batches[:-2], sequential_batches[-2], sequential_batches[-1]
 
@@ -1182,12 +1159,15 @@ class Agent:
                 as_tensor(reward_batch, self.device),
                 as_tensor(done_batch, self.device),
                 pred_error_batch_t0t1, z_batch_t1,
-                img_batch_t1, mu_batch_t1, logvar_batch_t1)
+                img_batch_t1, mu_batch_t1, logvar_batch_t1,
+                ids, weights,
+                )
 
     def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
                                actions_batch_t1,
                                reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
+                               pred_error_batch_t0t1, alpha,
+                               ids, weights):
         with torch.no_grad():
             actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
 
@@ -1205,9 +1185,12 @@ class Agent:
         value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
         value_net_output_t1 = self.value_net(value_net_input_t1)
 
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
+        if self.prioritized:
+            diff = abs(value_net_output_t1 - expected_free_energy_estimate_batch)
+            self.buffer.update_priorities(ids[0], ids[1], diff.squeeze().detach().cpu().numpy())
+            return torch.mean((diff * as_tensor(weights, self.device)) ** 2)
+        else:
+            return F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
 
     def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
                                         pred_error_batch_t0t1, alpha, vae_loss):
@@ -1217,7 +1200,7 @@ class Agent:
         vfe_batch = vae_loss + pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
         return torch.mean(vfe_batch)
 
-    def _update_network(self):
+    def _update_network(self, current_episode):
 
         if self.actor_action_distribution == 'StateDependentNoiseDistribution':
             self.actor.reset_noise()
@@ -1225,7 +1208,7 @@ class Agent:
         # Retrieve transition data in mini batches:
         (state_batch_t1, state_batch_t2, actions_batch_t1,
          reward_batch, done_batch, pred_error_batch_t0t1, z_batch_t1,
-         encoder_input_t1, mu_t1, logvar_t1,) = self.get_mini_batches()
+         encoder_input_t1, mu_t1, logvar_t1, ids, weights,) = self.get_mini_batches(current_episode)
         # Compute the value network loss:
 
         # Action by the current actor for the sampled state
@@ -1254,7 +1237,8 @@ class Agent:
         vae_loss = self.images_vae.loss_function(recon_batch, encoder_input_t1, mu_t1, logvar_t1, M_N=0.00025)
 
         value_net_loss = self.compute_value_net_loss(state_batch_t1.detach(), state_batch_t2.detach(), actions_batch_t1,
-                                                     reward_batch, done_batch, pred_error_batch_t0t1, alpha)
+                                                     reward_batch, done_batch, pred_error_batch_t0t1, alpha,
+                                                     ids, weights)
 
         self.transition_net.optimizer.zero_grad()
         self.images_vae.optimizer.zero_grad()
@@ -1296,8 +1280,10 @@ class Agent:
         image_obs, _ = self._get_normalized_image_from_env()
 
         for episode_step in range(self._max_episode_steps):
-            action = self._select_action(episode_data.get_last_obs(self.vae_seq_len), observation)
+            last_obs = episode_data.get_last_obs(self.vae_seq_len - 1)
+            input_tensor = self._preprocess_inputs(last_obs, image_obs).detach()
 
+            action = self._select_action(input_tensor)
             # feed the actions into the environment
             new_observation, reward, _, info = self.env.step(action)
 
@@ -1306,7 +1292,7 @@ class Agent:
                              action.copy(), info)
             episode_summary.add(np.mean(reward), info)
 
-            new_image_obs, original_image = self._get_normalized_image_from_env()
+            new_image_obs, original_image = self._get_normalized_image_from_env(with_original_image=True)
 
             image_obs = new_image_obs
             observation = new_observation['observation']
@@ -1322,7 +1308,7 @@ class Agent:
         self.writer.add_text(self.experiment_name, self.experiment_description)
         print("Environment is: {}\nTraining started at {}".format(self.env.unwrapped.spec.id, datetime.now()))
 
-        # self.warmup()
+        self.warmup()
         for epoch in range(self.current_epoch, self.n_epochs + 1):
             for cycle in range(self.steps_per_epoch):
                 step = self.steps_per_epoch * epoch + cycle
@@ -1366,7 +1352,7 @@ class Agent:
                 train_iteration_metrics = []
                 for _ in range(self.n_training_iterations):
                     # train the network
-                    metrics_dict = self._update_network()
+                    metrics_dict = self._update_network(step)
                     train_iteration_metrics.append(metrics_dict)
 
                 train_iteration_metrics = {k: [dic[k] for dic in train_iteration_metrics]
@@ -1473,8 +1459,11 @@ class Agent:
         state_mu, state_logvar = self.images_vae.encode(vae_input_tensor)
         return torch.cat((state_mu, state_logvar), dim=1)
 
-    def _get_normalized_image_from_env(self):
-        original_image = self.env.render(mode='rgb_array', width=self.image_shape[0], height=self.image_shape[1])
+    def _get_normalized_image_from_env(self, with_original_image=False):
+        if with_original_image:
+            original_image = self.env.render(mode='rgb_array')
+        else:
+            original_image = self.env.render(mode='rgb_array', width=self.image_shape[0], height=self.image_shape[1])
         image_obs = np.resize(original_image.astype(np.float32), self.image_shape)
         image_obs /= 255
         return image_obs, original_image

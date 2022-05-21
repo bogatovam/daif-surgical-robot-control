@@ -1,7 +1,6 @@
 experiment_name: temp
 experiment_description: "test mdp sac with this task"
 
-monitor_file: logs\{experiment_name}\monitor.csv
 tb_log_folder: logs\tensorboard\{experiment_name}
 seed: 42
 
@@ -14,10 +13,10 @@ hparams:
 
 should_save_model: true
 model_path: models\{experiment_name}
-model_save_timer: 10
+model_save_timer: 2
 
 
 should_save_episode_video: true
-episode_video_timer: 5
+episode_video_timer: 2
 video_log_folder: logs\gif\{experiment_name}
 

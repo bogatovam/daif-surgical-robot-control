@@ -5,12 +5,12 @@ hparams:
 # HER
   replay_strategy: future
   replay_k: 4
-  prioritized: false
+  prioritized: true
 
 #  Networks
-  actor_layers:  [128, 256, 128]
-  transition_net_layers: [128, 128, 128]
-  value_net_layers: [128, 256, 128]
+  actor_layers:  [256, 512, 256]
+  transition_net_layers: [256, 256, 256]
+  value_net_layers: [256, 512, 256]
 
   actor_lr: 0.0003
   transition_net_lr: 0.00005
@@ -38,10 +38,10 @@ hparams:
 #  mlp
 #  gru
 #  lstm
-  transition_network_type: mlp
+  transition_network_type: gru
 
-  vae_type: original
-  observations_seq_len: 4 # default 3
+  vae_type: beta
+  rnn_seq_len: 8
   vae_pretrained_path: pretrained-vae/NeedleReach-beta.pth
 
 vae:
