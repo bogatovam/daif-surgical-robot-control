@@ -5,7 +5,7 @@ hparams:
   # HER
   replay_strategy: future
   replay_k: 4
-  prioritized: false
+  prioritized: true
 
   #  Networks
   actor_layers: [ 256, 512, 256 ]
@@ -38,7 +38,7 @@ hparams:
   #  mlp
   #  gru
   #  lstm
-  transition_network_type: gru
+  transition_network_type: mlp
 
   vae_type: beta
   rnn_seq_len: 8
