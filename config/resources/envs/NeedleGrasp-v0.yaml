@@ -2,54 +2,54 @@ env_id: NeedleGrasp-v0
 
 hparams:
   polyak: 0.95
-# HER
+  # HER
   replay_strategy: future
   replay_k: 4
+  prioritized: false
 
-#  Networks
-  actor_layers:  [128, 256, 128]
-  transition_net_layers: [128, 256, 128]
-  value_net_layers: [128, 256, 128]
+  #  Networks
+  actor_layers: [ 256, 512, 256 ]
+  transition_net_layers: [ 256, 256, 256 ]
+  value_net_layers: [ 256, 512, 256 ]
 
   actor_lr: 0.0003
-  transition_net_lr: 0.0003
+  transition_net_lr: 0.00005
   value_net_lr: 0.0003
   alpha_lr: 0.0003
+  vae_lr: 0.00005
 
   alpha: auto
   gamma: 1.00
   beta: 0.99
 
-#  available values list:
-#  sac_maximize
-#  sac_minimise
-#  sac_minimize_entropy
-#  adapted_daif
-  efe_approximation_approach: sac_maximize
+  #  available values list:
+  #  sac_maximize
+  #  sac_minimise
+  #  sac_minimize_entropy
+  #  adapted_daif
+  efe_approximation_approach: sac_minimise
 
-#  available values list:
-#  SquashedDiagGaussianDistribution
-#  StateDependentNoiseDistribution
+  #  available values list:
+  #  SquashedDiagGaussianDistribution
+  #  StateDependentNoiseDistribution
   actor_action_distribution: SquashedDiagGaussianDistribution
 
-#  available values list:
-#  mlp
-#  gru
-#  lstm
+  #  available values list:
+  #  mlp
+  #  gru
+  #  lstm
   transition_network_type: gru
 
-#  available values list:
-# Disentangled Beta-VAE
-# LogCosh
-# original
-  vae_type: LogCosh
-  rnn_seq_len: 6 # default 3
+  vae_type: beta
+  rnn_seq_len: 8
+  vae_pretrained_path: pretrained-vae/NeedleGrasp-v0_Beta821.pth
 
 vae:
   tb_log_folder: logs\vae\tensorboard\{experiment_name}
   hparams:
     memory_capacity: 50000
-    batch_size: 512
-    image_shape: [64, 64, 3]
-    vae_seq_len: 5
+    batch_size: 4
+    image_shape: [ 64, 64, 3 ]
+    vae_seq_len: 4
+    vae_n_latent_dims: 64
 
