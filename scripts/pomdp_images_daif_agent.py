@@ -1,14 +1,13 @@
 import copy
 import os.path
-from abc import abstractmethod, ABC
-from typing import Tuple, Optional, NamedTuple
+from abc import ABC
+from typing import Tuple, List, Any
 
 from stable_baselines3.common.utils import polyak_update
 
 import surrol.gym as surrol_gym
 from omegaconf import OmegaConf
-from stable_baselines3.common.distributions import StateDependentNoiseDistribution, \
-    TanhBijector, DiagGaussianDistribution, SquashedDiagGaussianDistribution
+from stable_baselines3.common.distributions import StateDependentNoiseDistribution, SquashedDiagGaussianDistribution
 from stable_baselines3.common.preprocessing import get_action_dim, is_image_space, maybe_transpose
 from stable_baselines3.common.torch_layers import create_mlp
 
@@ -22,25 +21,248 @@ from utils import MetricTracker, create_dirs
 from datetime import datetime
 import os.path
 
-import gym
-
 import os.path
 import random
 import sys
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-
-import gym
-
-import threading
 import numpy as np
 import imageio
+import gym
+import torch
+from torch import nn, Tensor, optim
+from abc import abstractmethod
+from torch import nn
+from torch.nn import functional as F
+
+
+class BaseVAE(BaseModel):
+
+    def __init__(self) -> None:
+        super(BaseVAE, self).__init__()
+
+    def encode(self, input: Tensor) -> List[Tensor]:
+        raise NotImplementedError
+
+    def decode(self, input: Tensor) -> Any:
+        raise NotImplementedError
+
+    def sample(self, batch_size: int, current_device: int, **kwargs) -> Tensor:
+        raise NotImplementedError
+
+    def generate(self, x: Tensor, **kwargs) -> Tensor:
+        raise NotImplementedError
+
+    @abstractmethod
+    def forward(self, *inputs: Tensor) -> Tensor:
+        pass
+
+    @abstractmethod
+    def loss_function(self, *inputs: Any, **kwargs):
+        pass
+
+
+class BetaVAE(BaseVAE):
+    num_iter = 0  # Global static variable to keep track of iterations
+
+    def __init__(self,
+                 in_channels: int,
+                 latent_dim: int,
+                 device='cpu',
+                 vae_lr=0.00005,
+                 hidden_dims: List = None,
+                 beta: int = 4,
+                 gamma: float = 1000.,
+                 max_capacity: int = 25,
+                 Capacity_max_iter: int = 1e5,
+                 loss_type: str = 'B',
+                 **kwargs) -> None:
+        super(BetaVAE, self).__init__()
+        self.device = device
+        self.in_channels = in_channels
+        self.latent_dim = latent_dim
+        self.hidden_dims = hidden_dims
+        self.beta = beta
+        self.gamma = gamma
+        self.max_capacity = max_capacity
+        self.Capacity_max_iter = Capacity_max_iter
+        self.loss_type = loss_type
+
+        self.latent_dim = latent_dim
+        self.beta = beta
+        self.gamma = gamma
+        self.loss_type = loss_type
+        self.C_max = torch.Tensor([max_capacity])
+        self.C_stop_iter = Capacity_max_iter
+
+        modules = []
+        if hidden_dims is None:
+            hidden_dims = [16, 32, 64, 128, 256]
+
+            # Build Encoder
+        for h_dim in hidden_dims:
+            modules.append(
+                nn.Sequential(
+                    nn.Conv3d(in_channels, out_channels=h_dim,
+                              kernel_size=(3, 3, 1), stride=(2, 2, 1),
+                              padding=(1, 1, 0)),
+                    nn.BatchNorm3d(h_dim),
+                    nn.LeakyReLU())
+            )
+            in_channels = h_dim
+
+        self.encoder = nn.Sequential(*modules)
+        self.fc_mu = nn.Linear(hidden_dims[-1] * 16, latent_dim)
+        self.fc_var = nn.Linear(hidden_dims[-1] * 16, latent_dim)
+
+        # Build Decoder
+        modules = []
+
+        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 16)
+
+        hidden_dims.reverse()
+
+        for i in range(len(hidden_dims) - 1):
+            modules.append(
+                nn.Sequential(
+                    nn.ConvTranspose3d(hidden_dims[i],
+                                       hidden_dims[i + 1],
+                                       kernel_size=(3, 3, 1),
+                                       stride=(2, 2, 1),
+                                       padding=(1, 1, 0),
+                                       output_padding=(1, 1, 0), ),
+                    nn.BatchNorm3d(hidden_dims[i + 1]),
+                    nn.LeakyReLU())
+            )
+
+        self.decoder = nn.Sequential(*modules)
+
+        self.final_layer = nn.Sequential(
+            nn.ConvTranspose3d(hidden_dims[-1],
+                               hidden_dims[-1],
+                               kernel_size=(3, 3, 1),
+                               stride=(2, 2, 1),
+                               padding=(1, 1, 0),
+                               output_padding=(1, 1, 0)),
+            nn.BatchNorm3d(hidden_dims[-1]),
+            nn.LeakyReLU(),
+            nn.Conv3d(hidden_dims[-1], out_channels=3, kernel_size=3, padding=1),
+            nn.Tanh())
+        self.optimizer = optim.Adam(self.parameters(), lr=vae_lr)
+
+        self.to(self.device)
+
+    def _get_constructor_parameters(self):
+        data = super()._get_constructor_parameters()
+
+        data.update(
+            dict(
+                devicie=self.device,
+                in_channels=self.in_channels,
+                latent_dim=self.latent_dim,
+                hidden_dims=self.hidden_dims,
+                beta=self.beta,
+                gamma=self.gamma,
+                max_capacity=self.max_capacity,
+                Capacity_max_iter=self.Capacity_max_iter,
+                loss_type=self.loss_type,
+            )
+        )
+        return data
+
+    def encode(self, input: Tensor) -> List[Tensor]:
+        """
+        Encodes the input by passing through the encoder network
+        and returns the latent codes.
+        :param input: (Tensor) Input tensor to encoder [N x C x H x W]
+        :return: (Tensor) List of latent codes
+        """
+        result = self.encoder(input)
+        result = torch.flatten(result, start_dim=1)
+
+        # Split the result into mu and var components
+        # of the latent Gaussian distribution
+        mu = self.fc_mu(result)
+        log_var = self.fc_var(result)
+
+        return [mu, log_var]
+
+    def decode(self, z: Tensor) -> Tensor:
+        result = self.decoder_input(z)
+        result = result.view(-1, 256, 2, 2, 4)
+        result = self.decoder(result)
+        result = self.final_layer(result)
+        return result
+
+    def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
+        """
+        Will a single z be enough ti compute the expectation
+        for the loss??
+        :param mu: (Tensor) Mean of the latent Gaussian
+        :param logvar: (Tensor) Standard deviation of the latent Gaussian
+        :return:
+        """
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return eps * std + mu
+
+    def forward(self, input: Tensor, **kwargs) -> Tensor:
+        mu, log_var = self.encode(input)
+        z = self.reparameterize(mu, log_var)
+        return [self.decode(z), input, mu, log_var]
+
+    def loss_function(self,
+                      *args,
+                      **kwargs):
+        self.num_iter += 1
+        recons = args[0]
+        input = args[1]
+        mu = args[2]
+        log_var = args[3]
+        kld_weight = kwargs['M_N']  # Account for the minibatch samples from the dataset
+
+        recons_loss = F.mse_loss(recons, input)
+
+        kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
+
+        if self.loss_type == 'H':  # https://openreview.net/forum?id=Sy2fzU9gl
+            loss = recons_loss + self.beta * kld_weight * kld_loss
+        elif self.loss_type == 'B':  # https://arxiv.org/pdf/1804.03599.pdf
+            self.C_max = self.C_max.to(input.device)
+            C = torch.clamp(self.C_max / self.C_stop_iter * self.num_iter, 0, self.C_max.data[0])
+            loss = recons_loss + self.gamma * kld_weight * (kld_loss - C).abs()
+        else:
+            raise ValueError('Undefined loss type.')
+        return loss
+
+    def sample(self,
+               num_samples: int,
+               current_device: int, **kwargs) -> Tensor:
+        """
+        Samples from the latent space and return the corresponding
+        image space map.
+        :param num_samples: (Int) Number of samples
+        :param current_device: (Int) Device to run the model
+        :return: (Tensor)
+        """
+        z = torch.randn(num_samples,
+                        self.latent_dim)
+
+        z = z.to(current_device)
+
+        samples = self.decode(z)
+        return samples
+
+    def generate(self, x: Tensor, **kwargs) -> Tensor:
+        """
+        Given an input image x, returns the reconstructed image
+        :param x: (Tensor) [B x C x H x W]
+        :return: (Tensor) [B x C x H x W]
+        """
+
+        return self.forward(x)[0]
 
 
 class ReplayBuffer:
-    def __init__(self, env, max_episode_steps, buffer_size, sample_func, device):
+    def __init__(self, env, max_episode_steps, buffer_size, sample_func, device, image_shape):
         self.observation_dim, self.goal_dim, self.action_dim, self.action_max = get_env_parameters(env)
         self.device = device
 
@@ -52,36 +274,49 @@ class ReplayBuffer:
         self.sample_func = sample_func
         # create the buffer to store info
 
+        self.observation_image_memory = np.empty([self.size, self.max_episode_steps, *image_shape], dtype=np.float32)
         self.observation_memory = np.empty([self.size, self.max_episode_steps, self.observation_dim], dtype=np.float32)
         self.achieved_goal_memory = np.empty([self.size, self.max_episode_steps, self.goal_dim], dtype=np.float32)
         self.desired_goal_memory = np.empty([self.size, self.max_episode_steps, self.goal_dim], dtype=np.float32)
         self.actions_memory = np.empty([self.size, self.max_episode_steps, self.action_dim], dtype=np.float32)
         self.info_memory = np.empty([self.size, self.max_episode_steps, 1], dtype=object)
+        self.priority_memory = np.ones([self.size, self.max_episode_steps, 1], dtype=np.float32)
+
+    def update_priorities(self, episode_idx, time_idx, priorities):
+        self.priority_memory[episode_idx, time_idx] = np.expand_dims(abs(priorities), 1)
 
     # store the episode
-    def store_episode(self, observation, achieved_goal, desired_goal, action, n_episodes_to_store, info):
+    def store_episode(self, observation, image_observation, achieved_goal, desired_goal, action, info,
+                      n_episodes_to_store):
         ids = self._get_storage_idx(inc=n_episodes_to_store)
         # store the information
+        self.observation_image_memory[ids] = image_observation
         self.observation_memory[ids] = observation
         self.achieved_goal_memory[ids] = achieved_goal
         self.desired_goal_memory[ids] = desired_goal
         self.actions_memory[ids] = action
         self.info_memory[ids] = np.expand_dims(info, -1)
+        self.priority_memory[ids] = np.reshape(np.repeat(self.priority_memory.max(),
+                                                         self.max_episode_steps * n_episodes_to_store),
+                                               newshape=(n_episodes_to_store, self.max_episode_steps, 1))
 
         self.n_transitions_stored += self.max_episode_steps * n_episodes_to_store
 
     # sample the data from the replay buffer
-    def sample(self, batch_size):
+    def sample(self, batch_size, current_episode):
+        observation_image_buffer = self.observation_image_memory[:self.current_size]
         observation_buffer = self.observation_memory[:self.current_size]
         achieved_goal_buffer = self.achieved_goal_memory[:self.current_size]
         desired_goal_buffer = self.desired_goal_memory[:self.current_size]
         actions_buffer = self.actions_memory[:self.current_size]
         info_buffer = self.info_memory[:self.current_size]
+        priorities_buffer = self.priority_memory[:self.current_size]
 
         return self.sample_func(observation_buffer,
+                                observation_image_buffer,
                                 achieved_goal_buffer, desired_goal_buffer,
-                                actions_buffer, info_buffer,
-                                batch_size)
+                                actions_buffer, info_buffer, priorities_buffer,
+                                batch_size, current_episode)
 
     def _get_storage_idx(self, inc=None):
         inc = inc or 1
@@ -100,54 +335,68 @@ class ReplayBuffer:
         return idx
 
 
-class HERSampler:
-    def __init__(self, replay_strategy, replay_k, rnn_seq_len, reward_func=None):
-        self.replay_strategy = replay_strategy
-        self.replay_k = replay_k
-        if self.replay_strategy == 'future':
-            self.future_p = 1 - (1. / (1 + replay_k))
-        else:
-            self.future_p = 0
-        self.reward_func = reward_func
-        self.rnn_seq_len = rnn_seq_len
-        self.total_seq_len = rnn_seq_len + 2
+def exponential_annealing_schedule(n, rate):
+    return 1 - np.exp(-rate * n)
 
-    def sample_her_transitions(self, observation_buffer,
-                               achieved_goal_buffer, desired_goal_buffer,
-                               actions_buffer, info_buffer, batch_size):
+
+class SimpleSampler:
+    def __init__(self, rnn_seq_len, vae_seq_len, reward_func, seed, prioritized=False, alpha: float = 0.0):
+        self.rnn_seq_len = rnn_seq_len
+        self.vae_seq_len = vae_seq_len
+        self.total_seq_len = self.rnn_seq_len + self.vae_seq_len - 1 + 2
+        self.prioritized = prioritized
+        self._alpha = alpha
+        self.reward_func = reward_func
+        self.beta_schedule = lambda n: exponential_annealing_schedule(n, 1e-2)
+        self._random_state = np.random.RandomState(seed)
+
+    def sample_transitions(self, observation_buffer, observation_image_buffer,
+                           achieved_goal_buffer, desired_goal_buffer,
+                           actions_buffer, info_buffer, priorities, batch_size, current_episode):
         # Trajectory length
-        trajectory_length = actions_buffer.shape[1]
+        trajectory_length = actions_buffer.shape[1] - self.total_seq_len
 
         # Buffer size
         buffer_length = actions_buffer.shape[0]
 
-        # generate ids which trajectories to use
-        episode_ids = np.random.randint(low=0, high=buffer_length, size=batch_size)
+        episode_ids = None
+        if self.prioritized:
+            episode_priorities = np.mean(priorities, axis=1)
+            sampling_probs = episode_priorities ** self._alpha / np.sum(episode_priorities ** self._alpha)
+            episode_ids = self._random_state.choice(np.arange(buffer_length), size=batch_size,
+                                                    replace=True, p=np.squeeze(sampling_probs))
+        else:
+            episode_ids = np.random.randint(low=0, high=buffer_length, size=batch_size)
 
         # generate ids which timestamps to use
         # - 2 because we sample for 3 sequential timestamps
-        t_samples = np.random.randint(low=0, high=trajectory_length - self.total_seq_len, size=batch_size)
-
-        # her idx
-        her_indexes = np.where(np.random.uniform(size=batch_size) < self.future_p)
-
-        # Sample 'future' timestamps for each 't_samples'
-        future_offset = np.random.uniform(size=batch_size) * (trajectory_length - self.total_seq_len - t_samples)
-        future_offset = future_offset.astype(int)
-        future_t = (t_samples + future_offset)[her_indexes]
+        weights = None
+        t_samples = None
+        if self.prioritized:
+            beta = self.beta_schedule(current_episode)
+            weights = np.zeros(shape=batch_size)
+            time_priorities = priorities[episode_ids]
+            t_samples = np.zeros(shape=batch_size, dtype=int)
+            for i in range(batch_size):
+                sampling_probs = (time_priorities[i][:trajectory_length] ** self._alpha / np.sum(
+                    time_priorities[i][:trajectory_length] ** self._alpha))
+                t_samples[i] = self._random_state.choice(np.arange(trajectory_length), size=1,
+                                                         replace=True, p=np.squeeze(sampling_probs)).astype(int)
+                weights[i] = (buffer_length * sampling_probs[t_samples[i]]) ** (-beta)
+            weights = weights / weights.max()
+        else:
+            t_samples = np.random.randint(low=0, high=trajectory_length, size=batch_size)
 
         sequential_batches = []
         for time_i in range(self.total_seq_len):
-            t_i = self._sample_for_time(observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
-                                        info_buffer,
-                                        episode_ids, t_samples, her_indexes, future_t,
+            t_i = self._sample_for_time(observation_buffer, observation_image_buffer,
+                                        achieved_goal_buffer, desired_goal_buffer, actions_buffer, info_buffer,
+                                        episode_ids, t_samples,
                                         batch_size=batch_size, time=time_i)
             sequential_batches.append(t_i)
 
-        (_, achieved_goal_batch_t1, desired_goal_batch_t1, _, info) = sequential_batches[-2]
+        (_, _, achieved_goal_batch_t1, desired_goal_batch_t1, _, info) = sequential_batches[-2]
 
-        # Recompute the reward for the augmented 'desired_goal'
-        # todo use achieved_goal_batch_t2 and desired_goal_batch_t1?
         reward_batch = self.reward_func(achieved_goal_batch_t1, desired_goal_batch_t1, info=info)
         # Recompute the termination state for the augmented 'desired_goal'
         done_batch = reward_batch == 0
@@ -162,12 +411,13 @@ class HERSampler:
         if len(reward_batch.shape) == 1:
             reward_batch = reward_batch.reshape(batch_size, 1)
 
-        return sequential_batches, reward_batch, done_batch
+        return sequential_batches, reward_batch, done_batch, (episode_ids, t_samples), weights
 
-    def _sample_for_time(self, observation_buffer, achieved_goal_buffer, desired_goal_buffer, actions_buffer,
-                         info_buffer,
-                         episode_idxs, t_samples, her_indexes, future_t, batch_size, time):
+    def _sample_for_time(self, observation_buffer, observation_image_buffer,
+                         achieved_goal_buffer, desired_goal_buffer, actions_buffer, info_buffer,
+                         episode_idxs, t_samples, batch_size, time):
         observation_batch = observation_buffer[:, time:, :][episode_idxs, t_samples].copy()
+        observation_image_batch = observation_image_buffer[:, time:, :][episode_idxs, t_samples].copy()
         achieved_goal_batch = achieved_goal_buffer[:, time:, :][episode_idxs, t_samples].copy()
         desired_goal_batch = desired_goal_buffer[:, time:, :][episode_idxs, t_samples].copy()
         actions_batch = actions_buffer[:, time:, :][episode_idxs, t_samples].copy()
@@ -175,24 +425,16 @@ class HERSampler:
 
         # Reshape the batch
         observation_batch = observation_batch.reshape(batch_size, *observation_batch.shape[1:])
+        observation_image_batch = observation_image_batch.reshape(batch_size, *observation_image_batch.shape[1:])
         achieved_goal_batch = achieved_goal_batch.reshape(batch_size, *achieved_goal_batch.shape[1:])
         desired_goal_batch = desired_goal_batch.reshape(batch_size, *desired_goal_batch.shape[1:])
         actions_batch = actions_batch.reshape(batch_size, *actions_batch.shape[1:])
 
-        # Get the achieved_goal at the 'future' timestamps
-        next_achieved_goal = achieved_goal_buffer[:, time:, :][episode_idxs[her_indexes], future_t]
-        next_info_batch = info_buffer[:, time:, :][episode_idxs[her_indexes], future_t]
-        # Replace the 'desired_goal' with the 'next_achieved_goal'
-        desired_goal_batch[her_indexes] = next_achieved_goal
-        info_batch[her_indexes] = next_info_batch
-
         info_batch = info_batch.reshape(batch_size)
         info_batch = {k: [dic[k] for dic in info_batch] for k in info_batch[0]}
-
         for k, v in info_batch.items():
             info_batch[k] = np.expand_dims(np.asarray(v), -1)
-
-        return observation_batch, achieved_goal_batch, desired_goal_batch, actions_batch, info_batch
+        return observation_batch, observation_image_batch, achieved_goal_batch, desired_goal_batch, actions_batch, info_batch
 
 
 class Normalizer:
@@ -407,7 +649,6 @@ class Actor(BasePolicy):
         self.action_dist.sample_weights(self.log_std, batch_size=batch_size)
 
     def get_action_dist_params(self, observations: torch.Tensor):
-        # features = self.extract_features(observations)
         latent_pi = self.latent_pi(observations)
         mean_actions = self.mu(latent_pi)
 
@@ -460,28 +701,59 @@ class MLP(BaseModel):
 
 
 class TransitionModelMlpPreprocessor:
-    def __init__(self, preprocess_func, device):
+    def __init__(self, preprocess_func, rnn_seq_len, vae_seq_len, device, image_shape, batch_size):
         super(TransitionModelMlpPreprocessor, self).__init__()
         self.preprocess_func = preprocess_func
         self.device = device
+        self.rnn_seq_len = rnn_seq_len
+        self.vae_seq_len = vae_seq_len
+        self.image_shape = image_shape
+        self.batch_size = batch_size
 
     def preprocess(self, sequence_of_batches):
-        (observation_batch, _, desired_goal_batch, actions_batch_t0, _) = sequence_of_batches[-1]
-        state_batch_t0 = self.preprocess_func(observation_batch, desired_goal_batch)
-        return torch.cat((state_batch_t0, as_tensor(actions_batch_t0, self.device)), dim=1)
+        (_, _, _, _, actions_batch, _) = sequence_of_batches[-1]
+        time_vae_images = []
+        for vae_time in reversed(range(self.vae_seq_len)):
+            (_, images, _, _, _, _) = sequence_of_batches[-vae_time]
+            time_vae_images.append(images)
+
+        time_vae_images = np.asarray(time_vae_images)  # (self.vae_seq_len, batch, image.h, image.w, 3)
+        time_vae_images = np.reshape(time_vae_images,
+                                     newshape=(self.batch_size,
+                                               3, self.image_shape[0], self.image_shape[1],
+                                               self.vae_seq_len))
+
+        state_batch = self.preprocess_func(np.asarray(time_vae_images)).detach()
+        return torch.cat((state_batch, as_tensor(actions_batch, self.device)), dim=1)
 
 
 class TransitionModelRnnPreprocessor:
-    def __init__(self, preprocess_func, device):
+    def __init__(self, preprocess_func, rnn_seq_len, vae_seq_len, device, image_shape, batch_size):
         super(TransitionModelRnnPreprocessor, self).__init__()
         self.preprocess_func = preprocess_func
         self.device = device
+        self.rnn_seq_len = rnn_seq_len
+        self.vae_seq_len = vae_seq_len
+        self.image_shape = image_shape
+        self.batch_size = batch_size
 
     def preprocess(self, sequence_of_batches):
         final_batch = []
-        for time in range(len(sequence_of_batches)):
-            (observation_batch, _, desired_goal_batch, actions_batch, _) = sequence_of_batches[time]
-            state_batch = self.preprocess_func(observation_batch, desired_goal_batch)
+        for time in reversed(range(self.rnn_seq_len)):
+            (_, _, _, _, actions_batch, _) = sequence_of_batches[-time]
+
+            time_vae_images = []
+            for vae_time in reversed(range(self.vae_seq_len)):
+                (_, images, _, _, _, _) = sequence_of_batches[-time - vae_time]
+                time_vae_images.append(images)
+
+            time_vae_images = np.asarray(time_vae_images)  # (self.vae_seq_len, batch, image.h, image.w, 3)
+            time_vae_images = np.reshape(time_vae_images,
+                                         newshape=(self.batch_size,
+                                                   3, self.image_shape[0], self.image_shape[1],
+                                                   self.vae_seq_len))
+
+            state_batch = self.preprocess_func(time_vae_images).detach()
             final_batch.append(torch.cat((state_batch, as_tensor(actions_batch, self.device)), dim=1))
         return torch.stack(final_batch, dim=1)
 
@@ -610,21 +882,23 @@ class GRU(BaseModel):
 class EpisodeData:
 
     def __init__(self):
+        self.image_observation = []
         self.observation = []
         self.achieved_goal = []
         self.desired_goal = []
         self.action = []
         self.info = []
 
-    def add(self, observation, achieved_goal, desired_goal, action, info):
+    def add(self, observation, image_observation, achieved_goal, desired_goal, action, info):
         self.observation.append(observation)
+        self.image_observation.append(image_observation)
         self.achieved_goal.append(achieved_goal)
         self.desired_goal.append(desired_goal)
         self.action.append(action)
         self.info.append(info)
 
     def as_numpy_arrays(self):
-        return np.asarray(self.observation), np.asarray(self.achieved_goal), \
+        return np.asarray(self.observation), np.asarray(self.image_observation), np.asarray(self.achieved_goal), \
                np.asarray(self.desired_goal), np.asarray(self.action), np.asarray(self.info)
 
     @classmethod
@@ -638,6 +912,9 @@ class EpisodeData:
         for key, value in data.__dict__.items():
             data_as_dict[key] = np.asarray(value)
         return data_as_dict
+
+    def get_last_obs(self, vae_seq_len):
+        return np.asarray(self.image_observation[-vae_seq_len:])
 
 
 class EpisodeSummary:
@@ -679,181 +956,6 @@ class EpisodeSummary:
         return data_as_dict
 
 
-class SacMaximise:
-
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 - alpha * log_prob_t2.reshape(-1, 1)
-
-            # Determine the batch of bootstrapped estimates of the EFEs:
-            expected_free_energy_estimate_batch = (
-                    reward_batch - pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
-
-        # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 - self.gamma * expected_free_energy_t1
-        return torch.mean(vfe_batch)
-
-
-class SacMinimise:
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 + alpha * log_prob_t2.reshape(-1, 1)
-
-            # Determine the batch of bootstrapped estimates of the EFEs:
-            expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
-
-        # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
-        return torch.mean(vfe_batch)
-
-
-class SacMinimiseEntropy:
-
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 - alpha * log_prob_t2.reshape(-1, 1)
-
-            # Determine the batch of bootstrapped estimates of the EFEs:
-            expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
-
-        # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
-        return torch.mean(vfe_batch)
-
-
-class AdaptedDaif:
-
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            weighted_targets = -log_prob_t2 * target_expected_free_energies_batch_t2
-
-            expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
-
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        # Weigh them according to the action distribution:
-        energy_batch = (-self.gamma * expected_free_energy_t1)
-
-        # Determine the entropy of the action distribution
-        entropy_batch = -pred_log_prob_t1 * alpha
-
-        # Determine the Variable Free Energy, then take the mean over all batch samples:
-        vfe_batch = pred_error_batch_t0t1 + (energy_batch - entropy_batch)
-        vfe = torch.mean(vfe_batch)
-        return vfe
-
-
 class Agent:
     def __init__(self, env, config):
         self.env = env
@@ -861,6 +963,7 @@ class Agent:
         self.experiment_description = config.experiment_description
         self.observation_dim, self.goal_dim, self.action_dim, self.action_max = get_env_parameters(env)
 
+        self.image_shape = config.vae.hparams.image_shape
         self.device = config.device_id
 
         self.polyak = int(config.hparams.polyak)
@@ -897,24 +1000,42 @@ class Agent:
         self.actions_shape = self.env.action_space.shape
         self.action_dim = self.env.action_space.shape[-1]
         self.rnn_seq_len = config.hparams.rnn_seq_len  # The discount rate
+        self.rnn_seq_len = config.hparams.rnn_seq_len
+        self.vae_seq_len = config.vae.hparams.vae_seq_len
 
         assert (self.n_rollout_episodes >= self.rnn_seq_len)
         assert (self.n_warmap_episodes >= self.rnn_seq_len)
+        self.images_vae = BetaVAE(3, config.vae.hparams.vae_n_latent_dims, vae_lr=config.hparams.vae_lr,
+                                  device=self.device)
 
         self.current_epoch = 0
+
+        self.prioritized = config.hparams.prioritized
+        self.sampler = SimpleSampler(self.vae_seq_len, self.rnn_seq_len,
+                                     self.env.compute_reward, config.seed,
+                                     self.prioritized, 0.4)
+        # create the replay buffer
+        self.buffer = ReplayBuffer(self.env, self._max_episode_steps, self.memory_capacity,
+                                   self.sampler.sample_transitions, config.device_id, self.image_shape)
+
+        self.vae_n_latent_dims = config.vae.hparams.vae_n_latent_dims
+        self.latent_state_shape = self.vae_n_latent_dims * 2
         self.actor = Actor(env.observation_space, env.action_space,
-                           self.state_size,
+                           self.latent_state_shape,
                            OmegaConf.to_object(config.hparams.actor_layers),
                            action_distribution_type=self.actor_action_distribution,
                            lr=config.hparams.actor_lr,
                            device=self.device)
 
-        self.value_net = MLP(self.state_size + self.action_dim,
+        # Value Net config
+        self.value_net = MLP(self.latent_state_shape + self.action_dim,
                              OmegaConf.to_object(config.hparams.value_net_layers),
                              1,
                              lr=config.hparams.value_net_lr,
                              device=self.device)
-        self.target_net = MLP(self.state_size + self.action_dim,
+
+        self.target_update_interval = 1
+        self.target_net = MLP(self.latent_state_shape + self.action_dim,
                               OmegaConf.to_object(config.hparams.value_net_layers),
                               1,
                               lr=config.hparams.value_net_lr,
@@ -923,27 +1044,42 @@ class Agent:
         self.transition_network_type = config.hparams.transition_network_type
 
         if self.transition_network_type == 'mlp':
-            self.transition_net = MLP(self.state_size + self.action_dim,
+            self.transition_net = MLP(self.latent_state_shape + self.action_dim,
                                       OmegaConf.to_object(config.hparams.transition_net_layers),
-                                      self.state_size,
+                                      self.latent_state_shape,
                                       lr=config.hparams.value_net_lr,
                                       device=self.device)
-            self.transition_preprocessor = TransitionModelMlpPreprocessor(self._preprocess_batch_inputs, self.device)
+            self.transition_preprocessor = TransitionModelMlpPreprocessor(self._preprocess_batch_inputs,
+                                                                          rnn_seq_len=self.rnn_seq_len,
+                                                                          vae_seq_len=self.vae_seq_len,
+                                                                          device=self.device,
+                                                                          image_shape=self.image_shape,
+                                                                          batch_size=self.batch_size)
         elif self.transition_network_type == 'lstm':
-            self.transition_net = LSTM(self.state_size + self.action_dim,
+            self.transition_net = LSTM(self.latent_state_shape + self.action_dim,
                                        OmegaConf.to_object(config.hparams.transition_net_layers),
-                                       self.state_size,
+                                       self.latent_state_shape,
                                        lr=config.hparams.value_net_lr,
                                        device=self.device)
-            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs, self.device)
+            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs,
+                                                                          rnn_seq_len=self.rnn_seq_len,
+                                                                          vae_seq_len=self.vae_seq_len,
+                                                                          device=self.device,
+                                                                          image_shape=self.image_shape,
+                                                                          batch_size=self.batch_size)
 
         elif self.transition_network_type == 'gru':
-            self.transition_net = GRU(self.state_size + self.action_dim,
+            self.transition_net = GRU(self.latent_state_shape + self.action_dim,
                                       OmegaConf.to_object(config.hparams.transition_net_layers),
-                                      self.state_size,
+                                      self.latent_state_shape,
                                       lr=config.hparams.value_net_lr,
                                       device=self.device)
-            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs, self.device)
+            self.transition_preprocessor = TransitionModelRnnPreprocessor(self._preprocess_batch_inputs,
+                                                                          rnn_seq_len=self.rnn_seq_len,
+                                                                          vae_seq_len=self.vae_seq_len,
+                                                                          device=self.device,
+                                                                          image_shape=self.image_shape,
+                                                                          batch_size=self.batch_size)
 
         # entropy coeff settings
         self.log_alpha = None
@@ -957,40 +1093,20 @@ class Agent:
         else:
             self.alpha_tensor = torch.tensor(float(self.alpha)).to(self.device)
 
-        if config.hparams.efe_approximation_approach == 'sac_maximize':
-            self.efe_approximation_approach = SacMaximise(self.actor, self.value_net, self.target_net,
-                                                          self.beta, self.gamma)
-        elif config.hparams.efe_approximation_approach == 'sac_minimise':
-            self.efe_approximation_approach = SacMinimise(self.actor, self.value_net, self.target_net,
-                                                          self.beta, self.gamma)
-        elif config.hparams.efe_approximation_approach == 'sac_minimize_entropy':
-            self.efe_approximation_approach = SacMinimiseEntropy(self.actor, self.value_net, self.target_net,
-                                                                 self.beta, self.gamma)
-        elif config.hparams.efe_approximation_approach == 'adapted_daif':
-            self.efe_approximation_approach = AdaptedDaif(self.actor, self.value_net, self.target_net,
-                                                          self.beta, self.gamma)
-
-        self.her_module = HERSampler(config.hparams.replay_strategy, config.hparams.replay_k, self.rnn_seq_len,
-                                     self.env.compute_reward)
-        # create the replay buffer
-        self.buffer = ReplayBuffer(self.env, self._max_episode_steps, self.memory_capacity,
-                                   self.her_module.sample_her_transitions, config.device_id)
-
-        self.o_norm = Normalizer(size=env.observation_space.spaces['observation'].shape[0])
-        self.g_norm = Normalizer(size=env.observation_space.spaces['desired_goal'].shape[0])
-        self.a_norm = Normalizer(size=self.action_dim)
-        self.target_update_interval = 1
+        self.vae_pretrained_path = prepare_path(config.hparams.vae_pretrained_path)
+        self.images_vae = self.images_vae.load(self.vae_pretrained_path, self.device)
 
         self.writer = TensorboardWriter(prepare_path(config.tb_log_folder, experiment_name=config.experiment_name),
                                         True)
 
         self.train_metrics = MetricTracker('vfe', 'value_net_loss', 'alpha', 'alpha_loss', 'success_rate', 'reward',
                                            'transition_net_grad', 'actor_grad_acc', 'value_net_grad',
-                                           'sde_std', 'transition_net_loss', 'goal_distance', 'jaw_state',
+                                           'sde_std', 'transition_net_loss', 'goal_distance', 'jaw_state', 'vae_loss',
                                            writer=self.writer)
 
         self.val_metrics = MetricTracker('val/success_rate', 'val/reward', writer=self.writer)
 
+        # just to save model configuration to logs
         with open(os.path.join(self.model_path, "config.yaml"), 'w+') as file:
             OmegaConf.save(config, file)
 
@@ -1013,16 +1129,22 @@ class Agent:
             saved_alpha_tensor = torch.load(os.path.join(self.model_path, 'alpha_tensor.pt'))
             self.alpha_tensor = saved_alpha_tensor
 
-    def get_mini_batches(self):
-        (sequential_batches, reward_batch, done_batch) = self.buffer.sample(self.batch_size)
+    def get_mini_batches(self, current_episode):
+        (sequential_batches, reward_batch, done_batch, ids, weights) = self.buffer.sample(self.batch_size,
+                                                                                          current_episode)
 
         transition_model_raw_input, t1, t2 = sequential_batches[:-2], sequential_batches[-2], sequential_batches[-1]
 
-        (observation_batch_t1, achieved_goal_batch_t1, desired_goal_batch_t1, actions_batch_t1, _) = t1
-        (observation_batch_t2, achieved_goal_batch_t2, desired_goal_batch_t2, actions_batch_t2, _) = t2
+        (_, _, _, _, actions_batch_t1, _) = t1
+        (_, _, _, _, actions_batch_t2, _) = t2
 
-        state_batch_t1 = self._preprocess_batch_inputs(observation_batch_t1, desired_goal_batch_t1)
-        state_batch_t2 = self._preprocess_batch_inputs(observation_batch_t2, desired_goal_batch_t2)
+        img_batch_t1, img_batch_t2 = self.get_encoder_input(sequential_batches)
+
+        mu_batch_t1, logvar_batch_t1 = self.images_vae.encode(img_batch_t1)
+        mu_batch_t2, logvar_batch_t2 = self.images_vae.encode(img_batch_t2)
+
+        state_batch_t1 = torch.cat((mu_batch_t1, logvar_batch_t1), dim=1)
+        state_batch_t2 = torch.cat((mu_batch_t2, logvar_batch_t2), dim=1)
 
         transition_net_input = self.transition_preprocessor.preprocess(transition_model_raw_input)
         pred_batch_t0t1 = self.transition_net(transition_net_input)
@@ -1030,19 +1152,63 @@ class Agent:
         pred_error_batch_t0t1 = torch.mean(
             F.mse_loss(pred_batch_t0t1, state_batch_t1, reduction='none'), dim=1).unsqueeze(1)
 
+        z_batch_t1 = self.images_vae.reparameterize(mu_batch_t1, logvar_batch_t1)
+
         return (state_batch_t1, state_batch_t2,
                 as_tensor(actions_batch_t1, self.device),
                 as_tensor(reward_batch, self.device),
                 as_tensor(done_batch, self.device),
-                pred_error_batch_t0t1)
+                pred_error_batch_t0t1, z_batch_t1,
+                img_batch_t1, mu_batch_t1, logvar_batch_t1,
+                ids, weights,
+                )
 
-    def _update_network(self):
+    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
+                               actions_batch_t1,
+                               reward_batch, done_batch,
+                               pred_error_batch_t0t1, alpha,
+                               ids, weights):
+        with torch.no_grad():
+            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
+
+            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
+            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
+
+            # H_t2 ~ -log_prob_t2
+            weighted_targets = target_expected_free_energies_batch_t2 + alpha * log_prob_t2.reshape(-1, 1)
+
+            # Determine the batch of bootstrapped estimates of the EFEs:
+            expected_free_energy_estimate_batch = (
+                    -reward_batch + pred_error_batch_t0t1 + (1.0 - done_batch) * self.beta * weighted_targets)
+
+        # Determine the Expected free energy at time t1 according to the value network:
+        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
+        value_net_output_t1 = self.value_net(value_net_input_t1)
+
+        if self.prioritized:
+            diff = abs(value_net_output_t1 - expected_free_energy_estimate_batch)
+            self.buffer.update_priorities(ids[0], ids[1], diff.squeeze().detach().cpu().numpy())
+            return torch.mean((diff * as_tensor(weights, self.device)) ** 2)
+        else:
+            return F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
+
+    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
+                                        pred_error_batch_t0t1, alpha, vae_loss):
+        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
+        expected_free_energy_t1 = self.value_net(value_net_input)
+
+        vfe_batch = vae_loss + pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
+        return torch.mean(vfe_batch)
+
+    def _update_network(self, current_episode):
+
         if self.actor_action_distribution == 'StateDependentNoiseDistribution':
             self.actor.reset_noise()
 
         # Retrieve transition data in mini batches:
         (state_batch_t1, state_batch_t2, actions_batch_t1,
-         reward_batch, done_batch, pred_error_batch_t0t1) = self.get_mini_batches()
+         reward_batch, done_batch, pred_error_batch_t0t1, z_batch_t1,
+         encoder_input_t1, mu_t1, logvar_t1, ids, weights,) = self.get_mini_batches(current_episode)
         # Compute the value network loss:
 
         # Action by the current actor for the sampled state
@@ -1066,40 +1232,37 @@ class Agent:
             alpha_loss.backward()
             self.alpha_optimizer.step()
 
-        value_net_loss = self.efe_approximation_approach.compute_value_net_loss(state_batch_t1, state_batch_t2,
-                                                                                actions_batch_t1,
-                                                                                reward_batch, done_batch,
-                                                                                pred_error_batch_t0t1,
-                                                                                alpha)
+        # Determine the reconstruction loss for time t1
+        recon_batch = self.images_vae.decode(z_batch_t1)
+        vae_loss = self.images_vae.loss_function(recon_batch, encoder_input_t1, mu_t1, logvar_t1, M_N=0.00025)
+
+        value_net_loss = self.compute_value_net_loss(state_batch_t1.detach(), state_batch_t2.detach(), actions_batch_t1,
+                                                     reward_batch, done_batch, pred_error_batch_t0t1, alpha,
+                                                     ids, weights)
+
         self.transition_net.optimizer.zero_grad()
+        self.images_vae.optimizer.zero_grad()
 
         self.value_net.optimizer.zero_grad()
         value_net_loss.backward()
-        value_net_grad = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 100000.)
         self.value_net.optimizer.step()
 
-        # Optimize the actor
         self.actor.optimizer.zero_grad()
-        # Compute the variational free energy:
-        vfe = self.efe_approximation_approach.compute_variational_free_energy(state_batch_t1,
-                                                                              sampled_actions_t1,
-                                                                              sampled_actions_log_prob_t1,
-                                                                              pred_error_batch_t0t1, alpha)
+        vfe = self.compute_variational_free_energy(state_batch_t1.detach(), sampled_actions_t1,
+                                                   sampled_actions_log_prob_t1, pred_error_batch_t0t1, alpha, vae_loss)
+
         vfe.backward()
-        actor_grad = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100000.)
-        transition_net_grad = torch.nn.utils.clip_grad_norm_(self.transition_net.parameters(), 100000.)
         self.actor.optimizer.step()
         self.transition_net.optimizer.step()
+        self.images_vae.optimizer.step()
 
         metrics = dict(
             vfe=vfe.item(),
-            actor_grad_acc=actor_grad.item(),
             alpha=alpha.item(),
             alpha_loss=alpha_loss.detach().item(),
             value_net_loss=value_net_loss.item(),
-            value_net_grad=value_net_grad.item(),
             transition_net_loss=pred_error_batch_t0t1.mean().item(),
-            transition_net_grad=transition_net_grad.item(),
+            vae_loss=vae_loss.mean().item(),
         )
         return metrics
 
@@ -1111,26 +1274,35 @@ class Agent:
     # do the evaluation
     def _eval_agent(self, epoch):
         images = []
-        reward_array = []
-        done = []
-        episode_step = 0
+        episode_data, episode_summary = EpisodeData(), EpisodeSummary()
+        observation, achieved_goal, desired_goal, done, reward = self._reset()
 
-        observation, _, desired_goal, _, _ = self._reset()
-        while episode_step < self._max_episode_steps:
-            input_tensor = self._preprocess_inputs(observation, desired_goal)
+        image_obs, _ = self._get_normalized_image_from_env()
+
+        for episode_step in range(self._max_episode_steps):
+            last_obs = episode_data.get_last_obs(self.vae_seq_len - 1)
+            input_tensor = self._preprocess_inputs(last_obs, image_obs).detach()
+
             action = self._select_action(input_tensor)
-
+            # feed the actions into the environment
             new_observation, reward, _, info = self.env.step(action)
 
+            episode_data.add(observation.copy(), image_obs.copy(),
+                             achieved_goal.copy(), desired_goal.copy(),
+                             action.copy(), info)
+            episode_summary.add(np.mean(reward), info)
+
+            new_image_obs, original_image = self._get_normalized_image_from_env(with_original_image=True)
+
+            image_obs = new_image_obs
             observation = new_observation['observation']
-            reward_array.append(reward)
-            done.append(info['is_success'])
-            episode_step += 1
+            achieved_goal = new_observation['achieved_goal']
 
             if self.should_save_episode_video and epoch % self.episode_video_timer == 0:
-                images += [self.env.render(mode='rgb_array')]
+                images += [original_image]
 
-        return np.mean(np.asarray(done)), np.mean(np.asarray(reward_array)), np.asarray(images)
+        return np.mean(np.asarray(episode_summary.done)), np.mean(np.asarray(episode_summary.reward)), \
+               np.asarray(images)
 
     def train(self):
         self.writer.add_text(self.experiment_name, self.experiment_description)
@@ -1148,18 +1320,23 @@ class Agent:
 
                     episode_data, episode_summary = EpisodeData(), EpisodeSummary()
                     observation, achieved_goal, desired_goal, done, reward = self._reset()
+                    image_obs, _ = self._get_normalized_image_from_env()
 
                     for episode_step in range(self._max_episode_steps):
-                        input_tensor = self._preprocess_inputs(observation, desired_goal)
+                        last_obs = episode_data.get_last_obs(self.vae_seq_len - 1)
+                        input_tensor = self._preprocess_inputs(last_obs, image_obs).detach()
+
                         action = self._select_action(input_tensor)
 
                         # feed the actions into the environment
                         new_observation, reward, _, info = self.env.step(action)
 
-                        episode_data.add(observation.copy(), achieved_goal.copy(), desired_goal.copy(), action.copy(),
-                                         info)
+                        episode_data.add(observation.copy(), image_obs.copy(),
+                                         achieved_goal.copy(), desired_goal.copy(),
+                                         action.copy(), info)
                         episode_summary.add(np.mean(reward), info)
 
+                        new_image_obs, _ = self._get_normalized_image_from_env()
                         observation = new_observation['observation']
                         achieved_goal = new_observation['achieved_goal']
 
@@ -1171,12 +1348,11 @@ class Agent:
 
                 # store the episodes
                 self.buffer.store_episode(**collected_step_episodes, n_episodes_to_store=self.n_rollout_episodes)
-                self._update_normalizer(**collected_step_episodes)
 
                 train_iteration_metrics = []
                 for _ in range(self.n_training_iterations):
                     # train the network
-                    metrics_dict = self._update_network()
+                    metrics_dict = self._update_network(step)
                     train_iteration_metrics.append(metrics_dict)
 
                 train_iteration_metrics = {k: [dic[k] for dic in train_iteration_metrics]
@@ -1261,39 +1437,36 @@ class Agent:
             action = self.actor.predict(input_tensor)
             return action.cpu().numpy().flatten()
 
-    def _preprocess_inputs(self, observation, goal):
-        observation = self.o_norm.normalize(observation)
-        goal = self.g_norm.normalize(goal)
-        # concatenate the stuffs
-        inputs = np.concatenate([observation, goal])
-        return torch.tensor(inputs, dtype=torch.float32, device=self.device).unsqueeze(0)
+    def _preprocess_inputs(self, last_n_obs, observation):
+        vae_input = np.expand_dims(observation, 0)
+        vae_input = np.repeat(vae_input, self.vae_seq_len - len(last_n_obs), axis=0)
 
-    def _preprocess_batch_inputs(self, observation_batch, goal_batch):
-        observation_batch = self.o_norm.normalize(observation_batch)
-        goal_batch = self.g_norm.normalize(goal_batch)
-        # concatenate the stuffs
-        inputs = np.concatenate([observation_batch, goal_batch], axis=1)
-        return torch.tensor(inputs, dtype=torch.float32, device=self.device)
+        if last_n_obs.size == 0:
+            vae_input_tensor = vae_input
+        else:
+            vae_input_tensor = np.concatenate([last_n_obs, vae_input], axis=0)
 
-    def _update_normalizer(self, observation, achieved_goal, desired_goal, action, info):
-        # get the number of normalization transitions
-        num_transitions = action.shape[0]
-        # create the new buffer to store them
-        sequential_batches, reward_batch, done_batch = self.her_module.sample_her_transitions(observation,
-                                                                                              achieved_goal,
-                                                                                              desired_goal,
-                                                                                              action,
-                                                                                              np.expand_dims(info, -1),
-                                                                                              num_transitions)
+        vae_input_tensor = as_tensor(vae_input_tensor, self.device)
+        vae_input_tensor = vae_input_tensor.view(1, 3, self.image_shape[0], self.image_shape[1], self.vae_seq_len)
 
-        (observation_batch, _, desired_goal_batch, _, _) = sequential_batches[0]
+        state_mu, state_logvar = self.images_vae.encode(vae_input_tensor)
+        return torch.cat((state_mu, state_logvar), dim=1)
 
-        # update
-        self.o_norm.update(observation_batch)
-        self.g_norm.update(desired_goal_batch)
-        # recompute the stats
-        self.o_norm.recompute_stats()
-        self.g_norm.recompute_stats()
+    def _preprocess_batch_inputs(self, observation):
+        vae_input_tensor = as_tensor(observation, self.device)
+        vae_input_tensor = vae_input_tensor.view(observation.shape[0], 3, self.image_shape[0], self.image_shape[1],
+                                                 self.vae_seq_len)
+        state_mu, state_logvar = self.images_vae.encode(vae_input_tensor)
+        return torch.cat((state_mu, state_logvar), dim=1)
+
+    def _get_normalized_image_from_env(self, with_original_image=False):
+        if with_original_image:
+            original_image = self.env.render(mode='rgb_array')
+        else:
+            original_image = self.env.render(mode='rgb_array', width=self.image_shape[0], height=self.image_shape[1])
+        image_obs = np.resize(original_image.astype(np.float32), self.image_shape)
+        image_obs /= 255
+        return image_obs, original_image
 
     def warmup(self):
         collected_step_episodes = []
@@ -1301,17 +1474,21 @@ class Agent:
 
             episode_data = EpisodeData()
             observation, achieved_goal, desired_goal, done, reward = self._reset()
+            image_obs, _ = self._get_normalized_image_from_env()
 
             for episode_step in range(self._max_episode_steps):
-                input_tensor = self._preprocess_inputs(observation, desired_goal)
+                last_obs = episode_data.get_last_obs(self.vae_seq_len - 1)
+
+                input_tensor = self._preprocess_inputs(last_obs, image_obs).detach()
                 action = self._select_action(input_tensor)
 
                 # feed the actions into the environment
                 new_observation, reward, _, info = self.env.step(action)
-
-                episode_data.add(observation.copy(), achieved_goal.copy(), desired_goal.copy(), action.copy(),
+                episode_data.add(observation.copy(), image_obs.copy(),
+                                 achieved_goal.copy(), desired_goal.copy(), action.copy(),
                                  info)
 
+                image_obs, _ = self._get_normalized_image_from_env()
                 observation = new_observation['observation']
                 achieved_goal = new_observation['achieved_goal']
 
@@ -1321,7 +1498,27 @@ class Agent:
 
         # store the episodes
         self.buffer.store_episode(**collected_step_episodes, n_episodes_to_store=self.n_warmap_episodes)
-        self._update_normalizer(**collected_step_episodes)
+
+    def get_encoder_input(self, sequence_of_batches):
+        final_batch = []
+        for time in reversed(range(2)):
+            (_, _, _, _, actions_batch, _) = sequence_of_batches[-time]
+
+            time_vae_images = []
+            for vae_time in reversed(range(self.vae_seq_len)):
+                (_, images, _, _, _, _) = sequence_of_batches[-time - vae_time]
+                time_vae_images.append(images)
+
+            time_vae_images = np.asarray(time_vae_images)  # (self.vae_seq_len, batch, image.h, image.w, 3)
+            time_vae_images = np.reshape(time_vae_images,
+                                         newshape=(actions_batch.shape[0],
+                                                   3, self.image_shape[0], self.image_shape[1],
+                                                   self.vae_seq_len))
+
+            time_vae_images_tensor = as_tensor(time_vae_images, self.device)
+            final_batch.append(time_vae_images_tensor)
+
+        return final_batch[0], final_batch[1]
 
 
 def make_env(config):
@@ -1404,4 +1601,4 @@ def train_agent_according_config(config):
 
 
 if __name__ == '__main__':
-    train_agent_according_config(get_config(env_id='NeedleReach-v0', device='cpu'))
+    train_agent_according_config(get_config(env_id='NeedleGrasp-v0', device='cpu'))

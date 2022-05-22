@@ -41,7 +41,7 @@ hparams:
   transition_network_type: mlp
 
   vae_type: beta
-  rnn_seq_len: 8
+  rnn_seq_len: 4
   vae_pretrained_path: pretrained-vae/NeedleGrasp-v0_Beta821.pth
 
 vae:
