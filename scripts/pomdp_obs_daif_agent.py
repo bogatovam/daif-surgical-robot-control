@@ -1285,7 +1285,7 @@ class Agent:
                              action.copy(), info)
             episode_summary.add(np.mean(reward), info)
 
-            _, original_image = self._get_image_from_env()
+            original_image = self._get_image_from_env()
 
             observation = new_observation['observation']
             achieved_goal = new_observation['achieved_goal']
@@ -1303,8 +1303,6 @@ class Agent:
         # self.warmup()
         for epoch in range(self.current_epoch, self.n_epochs + 1):
 
-            self.o_norm.reset()
-            self.g_norm.reset()
             for cycle in range(self.steps_per_epoch):
                 step = self.steps_per_epoch * epoch + cycle
                 self.writer.set_step(step)

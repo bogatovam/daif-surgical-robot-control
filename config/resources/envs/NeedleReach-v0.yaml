@@ -5,7 +5,7 @@ hparams:
   # HER
   replay_strategy: future
   replay_k: 4
-  prioritized: true
+  prioritized: false
 
   #  Networks
   actor_layers: [ 256, 512, 256 ]
@@ -42,7 +42,7 @@ hparams:
   transition_network_type: mlp
 
   vae_type: beta
-  rnn_seq_len: 4
+  rnn_seq_len: 1
   vae_pretrained_path: pretrained-vae/NeedleReach-beta.pth
 
 vae:
@@ -51,6 +51,6 @@ vae:
     memory_capacity: 50000
     batch_size: 4
     image_shape: [ 64, 64, 3 ]
-    vae_seq_len: 4
+    vae_seq_len: 7
     vae_n_latent_dims: 64
 
