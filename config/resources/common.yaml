@@ -1,4 +1,4 @@
-experiment_name: NeedleReach-adapted-daif-lstm-3
+experiment_name: NeedleGrasp-adapted-daif-lstm-last-rerun
 experiment_description: "test mdp sac with this task"
 
 tb_log_folder: logs\tensorboard\{experiment_name}
@@ -13,10 +13,10 @@ hparams:
 
 should_save_model: true
 model_path: models\{experiment_name}
-model_save_timer: 2
+model_save_timer: 1
 
 
 should_save_episode_video: true
-episode_video_timer: 2
+episode_video_timer: 1
 video_log_folder: logs\gif\{experiment_name}
 

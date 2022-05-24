@@ -1377,4 +1377,4 @@ def train_agent_according_config(config):
 
 
 if __name__ == '__main__':
-    train_agent_according_config(get_config(env_id='NeedleReach-v0', device='cpu'))
+    train_agent_according_config(get_config(env_id='NeedleGrasp-v0', device='cpu'))
