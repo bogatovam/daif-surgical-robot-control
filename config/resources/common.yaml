@@ -1,4 +1,4 @@
-experiment_name: pomdp-NeedleReach-v0-mlp-simple-sampling-no-image
+experiment_name: NeedleReach-adapted-daif-lstm-3
 experiment_description: "test mdp sac with this task"
 
 tb_log_folder: logs\tensorboard\{experiment_name}

@@ -732,7 +732,7 @@ class TransitionModelRnnPreprocessor:
     def preprocess(self, sequence_of_batches):
         final_batch = []
         for time in reversed(range(self.rnn_seq_len)):
-            (_, _, _, _, actions_batch, _) = sequence_of_batches[-time]
+            (_, _, _, actions_batch, _) = sequence_of_batches[-time]
 
             time_vae_obs = []
             time_vae_goal = []
@@ -1399,6 +1399,18 @@ class Agent:
 
                 if self.alpha_tensor is not None:
                     torch.save(self.alpha_tensor, os.path.join(epoch_path, 'alpha_tensor.pt'))
+
+                torch.save(torch.tensor(self.o_norm.std, dtype=torch.float32, device=self.device),
+                           os.path.join(epoch_path, 'o_norm_std_tensor.pt'))
+
+                torch.save(torch.tensor(self.o_norm.mean, dtype=torch.float32, device=self.device),
+                           os.path.join(epoch_path, 'o_norm_mean_tensor.pt'))
+
+                torch.save(torch.tensor(self.g_norm.std, dtype=torch.float32, device=self.device),
+                           os.path.join(epoch_path, 'g_norm_std_tensor.pt'))
+
+                torch.save(torch.tensor(self.g_norm.mean, dtype=torch.float32, device=self.device),
+                           os.path.join(epoch_path, 'g_norm_mean_tensor.pt'))
 
         self.env.close()
         print("Training finished at {}".format(datetime.now()))

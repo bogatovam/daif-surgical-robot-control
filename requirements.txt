@@ -14,3 +14,6 @@ moviepy
 pandas~=1.4.2
 surrol~=0.1.0
 imageio~=2.19.2
+pandas~=1.4.2
+surrol~=0.1.0
+imageio~=2.19.2

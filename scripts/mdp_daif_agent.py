@@ -458,6 +458,22 @@ class MLP(BaseModel):
             x = layer(x)
         return x
 
+    def _get_constructor_parameters(self):
+        data = super()._get_constructor_parameters()
+
+        data.update(
+            dict(
+                input_size=self.input_size,
+                layer_sizes=self.layer_sizes,
+                output_size=self.output_size,
+                lr=self.lr,
+                output_activation=self.output_activation,
+                activation=self.activation,
+                weight_decay=self.weight_decay,
+            )
+        )
+        return data
+
 
 class TransitionModelMlpPreprocessor:
     def __init__(self, preprocess_func, device):
@@ -826,7 +842,7 @@ class AdaptedDaif:
             targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
             target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
 
-            weighted_targets = -log_prob_t2 * target_expected_free_energies_batch_t2
+            weighted_targets = target_expected_free_energies_batch_t2
 
             expected_free_energy_estimate_batch = (
                     -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
@@ -1229,6 +1245,19 @@ class Agent:
 
                 if self.alpha_tensor is not None:
                     torch.save(self.alpha_tensor, os.path.join(epoch_path, 'alpha_tensor.pt'))
+
+                torch.save(torch.tensor(self.o_norm.std, dtype=torch.float32, device=self.device),
+                           os.path.join(epoch_path, 'o_norm_std_tensor.pt'))
+
+                torch.save(torch.tensor(self.o_norm.mean, dtype=torch.float32, device=self.device),
+                           os.path.join(epoch_path, 'o_norm_mean_tensor.pt'))
+
+                torch.save(torch.tensor(self.g_norm.std, dtype=torch.float32, device=self.device),
+                           os.path.join(epoch_path, 'g_norm_std_tensor.pt'))
+
+                torch.save(torch.tensor(self.g_norm.mean, dtype=torch.float32, device=self.device),
+                           os.path.join(epoch_path, 'g_norm_mean_tensor.pt'))
+
 
         self.env.close()
         print("Training finished at {}".format(datetime.now()))
