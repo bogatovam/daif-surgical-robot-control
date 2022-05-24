@@ -779,52 +779,7 @@ class SacMinimise:
         vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
         return torch.mean(vfe_batch)
 
-
-class SacMinimiseEntropy:
-
-    def __init__(self, actor, value_net, target_net, beta, gamma):
-        self.actor = actor
-        self.value_net = value_net
-        self.target_net = target_net
-        self.beta = beta
-        self.gamma = gamma
-
-    def compute_value_net_loss(self, state_batch_t1, state_batch_t2,
-                               actions_batch_t1,
-                               reward_batch, done_batch,
-                               pred_error_batch_t0t1, alpha):
-        with torch.no_grad():
-            actions_t2, log_prob_t2 = self.actor.action_log_prob(state_batch_t2)
-
-            targe_net_input = torch.cat([state_batch_t2, actions_t2], dim=1)
-            target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
-
-            # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 - alpha * log_prob_t2.reshape(-1, 1)
-
-            # Determine the batch of bootstrapped estimates of the EFEs:
-            expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
-
-        # Determine the Expected free energy at time t1 according to the value network:
-        value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
-        value_net_output_t1 = self.value_net(value_net_input_t1)
-
-        # Determine the MSE loss between the EFE estimates and the value network output:
-        mse = F.mse_loss(expected_free_energy_estimate_batch, value_net_output_t1)
-        return mse
-
-    def compute_variational_free_energy(self, state_batch_t1, predicted_actions_t1, pred_log_prob_t1,
-                                        pred_error_batch_t0t1, alpha):
-        value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
-        expected_free_energy_t1 = self.value_net(value_net_input)
-
-        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
-        return torch.mean(vfe_batch)
-
-
 class AdaptedDaif:
-
     def __init__(self, actor, value_net, target_net, beta, gamma):
         self.actor = actor
         self.value_net = value_net
@@ -858,16 +813,8 @@ class AdaptedDaif:
         value_net_input = torch.cat([state_batch_t1, predicted_actions_t1], dim=1)
         expected_free_energy_t1 = self.value_net(value_net_input)
 
-        # Weigh them according to the action distribution:
-        energy_batch = (-self.gamma * expected_free_energy_t1)
-
-        # Determine the entropy of the action distribution
-        entropy_batch = -pred_log_prob_t1 * alpha
-
-        # Determine the Variable Free Energy, then take the mean over all batch samples:
-        vfe_batch = pred_error_batch_t0t1 + (energy_batch - entropy_batch)
-        vfe = torch.mean(vfe_batch)
-        return vfe
+        vfe_batch = pred_error_batch_t0t1 + alpha * pred_log_prob_t1 + self.gamma * expected_free_energy_t1
+        return torch.mean(vfe_batch)
 
 
 class Agent:
@@ -979,9 +926,6 @@ class Agent:
         elif config.hparams.efe_approximation_approach == 'sac_minimise':
             self.efe_approximation_approach = SacMinimise(self.actor, self.value_net, self.target_net,
                                                           self.beta, self.gamma)
-        elif config.hparams.efe_approximation_approach == 'sac_minimize_entropy':
-            self.efe_approximation_approach = SacMinimiseEntropy(self.actor, self.value_net, self.target_net,
-                                                                 self.beta, self.gamma)
         elif config.hparams.efe_approximation_approach == 'adapted_daif':
             self.efe_approximation_approach = AdaptedDaif(self.actor, self.value_net, self.target_net,
                                                           self.beta, self.gamma)
