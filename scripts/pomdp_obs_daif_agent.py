@@ -1137,8 +1137,8 @@ class Agent:
         mu_batch_t1, logvar_batch_t1 = self.vae.encode(img_batch_t1)
         mu_batch_t2, logvar_batch_t2 = self.vae.encode(img_batch_t2)
 
-        state_batch_t1 = torch.cat((mu_batch_t1, logvar_batch_t1), dim=1)
-        state_batch_t2 = torch.cat((mu_batch_t2, logvar_batch_t2), dim=1)
+        state_batch_t1 = torch.cat((mu_batch_t1, torch.exp(logvar_batch_t1)), dim=1)
+        state_batch_t2 = torch.cat((mu_batch_t2, torch.exp(logvar_batch_t2)), dim=1)
 
         transition_net_input = self.transition_preprocessor.preprocess(transition_model_raw_input)
         pred_batch_t0t1 = self.transition_net(transition_net_input)
@@ -1169,7 +1169,7 @@ class Agent:
             target_expected_free_energies_batch_t2 = self.target_net(targe_net_input)
 
             # H_t2 ~ -log_prob_t2
-            weighted_targets = target_expected_free_energies_batch_t2 + alpha * log_prob_t2.reshape(-1, 1)
+            weighted_targets = target_expected_free_energies_batch_t2
 
             # Determine the batch of bootstrapped estimates of the EFEs:
             expected_free_energy_estimate_batch = (
@@ -1389,6 +1389,7 @@ class Agent:
                 self.transition_net.save(os.path.join(epoch_path, 'transition_net.pth'))
                 self.actor.save(os.path.join(epoch_path, 'actor.pth'))
                 self.value_net.save(os.path.join(epoch_path, 'value_net.pth'))
+                self.vae.save(os.path.join(epoch_path, 'vae.pth'))
 
                 if self.log_alpha is not None:
                     torch.save(self.log_alpha, os.path.join(epoch_path, 'log_alpha.pt'))
@@ -1474,7 +1475,7 @@ class Agent:
         vae_input_tensor = vae_input_tensor.view(1, self.vae_seq_len, self.obs_size)
 
         state_mu, state_logvar = self.vae.encode(vae_input_tensor)
-        return torch.cat((state_mu, state_logvar), dim=1)
+        return torch.cat((state_mu, torch.exp(state_logvar)), dim=1)
 
     def _preprocess_batch_inputs(self, observation_batch, goal_batch):
         observation_batch = self.o_norm.normalize(observation_batch)
@@ -1485,7 +1486,7 @@ class Agent:
         vae_input_tensor = as_tensor(inputs, self.device)
         vae_input_tensor = vae_input_tensor.view(observation_batch.shape[0], self.vae_seq_len, self.obs_size)
         state_mu, state_logvar = self.vae.encode(vae_input_tensor)
-        return torch.cat((state_mu, state_logvar), dim=1)
+        return torch.cat((state_mu, torch.exp(state_logvar)), dim=1)
 
     def _preprocess_without_encoding(self, observation_batch, goal_batch):
         observation_batch = self.o_norm.normalize(observation_batch)
@@ -1655,4 +1656,4 @@ def train_agent_according_config(config):
 
 
 if __name__ == '__main__':
-    train_agent_according_config(get_config(env_id='NeedleReach-v0', device='cpu'))
+    train_agent_according_config(get_config(env_id='NeedleGrasp-v0', device='cpu'))

@@ -5,12 +5,12 @@ hparams:
   # HER
   replay_strategy: future
   replay_k: 4
-  prioritized: true
+  prioritized: false
 
   #  Networks
   actor_layers: [ 256, 512, 256 ]
-  transition_net_layers: [ 128, 128, 32]
-  vae_layer_sizes: [ 64, 64, 64 ]
+  transition_net_layers: [ 128, 128, 256]
+  vae_layer_sizes: [ 32, 32, 32 ]
   value_net_layers: [ 256, 512, 256 ]
 
   actor_lr: 0.0003
