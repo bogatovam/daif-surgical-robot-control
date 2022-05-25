@@ -145,9 +145,7 @@ class BetaVAE(BaseVAE):
         data.update(
             dict(
                 devicie=self.device,
-                in_channels=self.in_channels,
                 latent_dim=self.latent_dim,
-                hidden_dims=self.hidden_dims,
                 beta=self.beta,
                 gamma=self.gamma,
                 max_capacity=self.max_capacity,
@@ -1656,4 +1654,4 @@ def train_agent_according_config(config):
 
 
 if __name__ == '__main__':
-    train_agent_according_config(get_config(env_id='NeedleGrasp-v0', device='cpu'))
+    train_agent_according_config(get_config(env_id='NeedleReach-v0', device='cpu'))

@@ -800,7 +800,7 @@ class AdaptedDaif:
             weighted_targets = target_expected_free_energies_batch_t2
 
             expected_free_energy_estimate_batch = (
-                    -reward_batch + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
+                    -reward_batch.reshape(-1, 1) + pred_error_batch_t0t1 + (1 - done_batch) * self.beta * weighted_targets)
 
         value_net_input_t1 = torch.cat([state_batch_t1, actions_batch_t1], dim=1)
         value_net_output_t1 = self.value_net(value_net_input_t1)
@@ -1377,4 +1377,4 @@ def train_agent_according_config(config):
 
 
 if __name__ == '__main__':
-    train_agent_according_config(get_config(env_id='PegTransfer-v0', device='cpu'))
+    train_agent_according_config(get_config(env_id='NeedlePickViaGrasp-v0', device='cpu'))

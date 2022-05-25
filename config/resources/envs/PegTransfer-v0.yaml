@@ -39,10 +39,10 @@ hparams:
   #  mlp
   #  gru
   #  lstm
-  transition_network_type: mlp
+  transition_network_type: lstm
 
   vae_type: beta
-  rnn_seq_len: 1
+  rnn_seq_len: 3
   vae_pretrained_path: pretrained-vae/NeedleReach-beta.pth
 
 vae:
