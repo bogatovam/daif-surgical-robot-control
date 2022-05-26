@@ -1444,8 +1444,8 @@ class Agent:
 
     def _preprocess_single_input(self, last_obs, last_goals, observation, desired_goal):
 
-        observation = self.o_norm.normalize(observation)
-        desired_goal = self.g_norm.normalize(desired_goal)
+        # observation = self.o_norm.normalize(observation)
+        # desired_goal = self.g_norm.normalize(desired_goal)
 
         vae_observation_input = np.expand_dims(observation, 0)
         vae_observation_input = np.repeat(vae_observation_input, self.vae_seq_len - len(last_obs), axis=0)
@@ -1454,16 +1454,16 @@ class Agent:
         vae_desired_goal_input = np.repeat(vae_desired_goal_input, self.vae_seq_len - len(last_goals), axis=0)
 
         if last_obs.size == 0:
-            vae_observation_input = self.o_norm.normalize(vae_observation_input)
-            vae_desired_goal_input = self.g_norm.normalize(vae_desired_goal_input)
+            # vae_observation_input = self.o_norm.normalize(vae_observation_input)
+            # vae_desired_goal_input = self.g_norm.normalize(vae_desired_goal_input)
 
             vae_input_tensor = np.concatenate([vae_observation_input, vae_desired_goal_input], axis=1)
         else:
-            last_obs = self.o_norm.normalize(last_obs)
-            last_goals = self.g_norm.normalize(last_goals)
-
-            vae_observation_input = self.o_norm.normalize(vae_observation_input)
-            vae_desired_goal_input = self.g_norm.normalize(vae_desired_goal_input)
+            # last_obs = self.o_norm.normalize(last_obs)
+            # last_goals = self.g_norm.normalize(last_goals)
+            #
+            # vae_observation_input = self.o_norm.normalize(vae_observation_input)
+            # vae_desired_goal_input = self.g_norm.normalize(vae_desired_goal_input)
 
             last_n = np.concatenate([last_obs, last_goals], axis=1)
             current = np.concatenate([vae_observation_input, vae_desired_goal_input], axis=1)
@@ -1476,8 +1476,8 @@ class Agent:
         return torch.cat((state_mu, torch.exp(state_logvar)), dim=1)
 
     def _preprocess_batch_inputs(self, observation_batch, goal_batch):
-        observation_batch = self.o_norm.normalize(observation_batch)
-        goal_batch = self.g_norm.normalize(goal_batch)
+        # observation_batch = self.o_norm.normalize(observation_batch)
+        # goal_batch = self.g_norm.normalize(goal_batch)
 
         inputs = np.concatenate([observation_batch, goal_batch], axis=2)
 
@@ -1487,8 +1487,8 @@ class Agent:
         return torch.cat((state_mu, torch.exp(state_logvar)), dim=1)
 
     def _preprocess_without_encoding(self, observation_batch, goal_batch):
-        observation_batch = self.o_norm.normalize(observation_batch)
-        goal_batch = self.g_norm.normalize(goal_batch)
+        # observation_batch = self.o_norm.normalize(observation_batch)
+        # goal_batch = self.g_norm.normalize(goal_batch)
         inputs = np.concatenate([observation_batch, goal_batch], axis=2)
         vae_input_tensor = as_tensor(inputs, self.device)
         return vae_input_tensor

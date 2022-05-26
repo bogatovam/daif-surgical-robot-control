@@ -10,7 +10,7 @@ hparams:
   #  Networks
   actor_layers: [ 256, 512, 256 ]
   transition_net_layers: [ 128, 128, 256]
-  vae_layer_sizes: [ 32, 32, 32 ]
+  vae_layer_sizes: [ 16, 16, 16 ]
   value_net_layers: [ 256, 512, 256 ]
 
   actor_lr: 0.0003
