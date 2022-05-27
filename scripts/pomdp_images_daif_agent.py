@@ -1143,8 +1143,8 @@ class Agent:
         mu_batch_t1, logvar_batch_t1 = self.images_vae.encode(img_batch_t1)
         mu_batch_t2, logvar_batch_t2 = self.images_vae.encode(img_batch_t2)
 
-        state_batch_t1 = torch.cat((mu_batch_t1, logvar_batch_t1), dim=1)
-        state_batch_t2 = torch.cat((mu_batch_t2, logvar_batch_t2), dim=1)
+        state_batch_t1 = torch.cat((mu_batch_t1, torch.exp(logvar_batch_t1)), dim=1)
+        state_batch_t2 = torch.cat((mu_batch_t2, torch.exp(logvar_batch_t2)), dim=1)
 
         transition_net_input = self.transition_preprocessor.preprocess(transition_model_raw_input)
         pred_batch_t0t1 = self.transition_net(transition_net_input)
@@ -1450,14 +1450,14 @@ class Agent:
         vae_input_tensor = vae_input_tensor.view(1, 3, self.image_shape[0], self.image_shape[1], self.vae_seq_len)
 
         state_mu, state_logvar = self.images_vae.encode(vae_input_tensor)
-        return torch.cat((state_mu, state_logvar), dim=1)
+        return torch.cat((state_mu, torch.exp(state_logvar)), dim=1)
 
     def _preprocess_batch_inputs(self, observation):
         vae_input_tensor = as_tensor(observation, self.device)
         vae_input_tensor = vae_input_tensor.view(observation.shape[0], 3, self.image_shape[0], self.image_shape[1],
                                                  self.vae_seq_len)
         state_mu, state_logvar = self.images_vae.encode(vae_input_tensor)
-        return torch.cat((state_mu, state_logvar), dim=1)
+        return torch.cat((state_mu, torch.exp(state_logvar)), dim=1)
 
     def _get_normalized_image_from_env(self, with_original_image=False):
         if with_original_image:
