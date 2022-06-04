@@ -192,40 +192,6 @@ class HERSampler:
         return observation_batch, achieved_goal_batch, desired_goal_batch, actions_batch, info_batch
 
 
-class Normalizer:
-    def __init__(self, size, eps=1e-2, default_clip_range=np.inf):
-        self.size = size
-        self.eps = eps
-        self.default_clip_range = default_clip_range
-
-        # some local information
-        self.local_sum = np.zeros(self.size, np.float32)
-        self.local_sumsq = np.zeros(self.size, np.float32)
-        self.local_count = np.zeros(1, np.float32)
-
-        # get the mean and std
-        self.mean = np.zeros(self.size, np.float32)
-        self.std = np.ones(self.size, np.float32)
-
-    # update the parameters of the normalizer
-    def update(self, v):
-        v = v.reshape(-1, self.size)
-        # do the computing
-        self.local_sum += v.sum(axis=0)
-        self.local_sumsq += (np.square(v)).sum(axis=0)
-        self.local_count[0] += v.shape[0]
-
-    def recompute_stats(self):
-        # calculate the new mean and std
-        self.mean = self.local_sum / self.local_count
-        self.std = np.sqrt(np.maximum(np.square(self.eps), (self.local_sumsq / self.local_count) - np.square(
-            self.local_sum / self.local_count)))
-
-    # normalize the observation
-    def normalize(self, v):
-        return (v - self.mean) / np.clip(self.std, 1e-9, None)
-
-
 class BasePolicy(BaseModel, ABC):
 
     def __init__(self,
@@ -612,9 +578,6 @@ class Agent:
         self.buffer = ReplayBuffer(self.env, self._max_episode_steps, self.memory_capacity,
                                    self.her_module.sample_her_transitions, config.device_id)
 
-        self.o_norm = Normalizer(size=env.observation_space.spaces['observation'].shape[0])
-        self.g_norm = Normalizer(size=env.observation_space.spaces['desired_goal'].shape[0])
-        self.a_norm = Normalizer(size=self.action_dim)
         self.target_update_interval = 1
 
         self.writer = TensorboardWriter(prepare_path(config.tb_log_folder, experiment_name=config.experiment_name),
@@ -812,7 +775,6 @@ class Agent:
 
                 # store the episodes
                 self.buffer.store_episode(**collected_step_episodes, n_episodes_to_store=self.n_rollout_episodes)
-                self._update_normalizer(**collected_step_episodes)
 
                 train_iteration_metrics = []
                 for _ in range(self.n_training_iterations):
@@ -900,40 +862,14 @@ class Agent:
             return action.cpu().numpy().flatten()
 
     def _preprocess_inputs(self, observation, goal):
-        observation = self.o_norm.normalize(observation)
-        goal = self.g_norm.normalize(goal)
         # concatenate the stuffs
         inputs = np.concatenate([observation, goal])
         return torch.tensor(inputs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
     def _preprocess_batch_inputs(self, observation_batch, goal_batch):
-        observation_batch = self.o_norm.normalize(observation_batch)
-        goal_batch = self.g_norm.normalize(goal_batch)
         # concatenate the stuffs
         inputs = np.concatenate([observation_batch, goal_batch], axis=1)
         return torch.tensor(inputs, dtype=torch.float32, device=self.device)
-
-    def _update_normalizer(self, observation, achieved_goal, desired_goal, action, info):
-        # get the number of normalization transitions
-        num_transitions = action.shape[0]
-        # create the new buffer to store them
-        sequential_batches, reward_batch, done_batch = self.her_module.sample_her_transitions(observation,
-                                                                                              achieved_goal,
-                                                                                              desired_goal,
-                                                                                              action,
-                                                                                              np.expand_dims(info, -1),
-                                                                                              num_transitions)
-
-        (observation_batch, _, desired_goal_batch, _, _) = sequential_batches[0]
-
-        # update
-        self.o_norm.update(observation_batch)
-        self.g_norm.update(desired_goal_batch)
-        # self.a_norm.update(actions)
-        # recompute the stats
-        self.o_norm.recompute_stats()
-        self.g_norm.recompute_stats()
-        # self.a_norm.recompute_stats()
 
     def warmup(self):
         collected_step_episodes = []
@@ -961,7 +897,6 @@ class Agent:
 
         # store the episodes
         self.buffer.store_episode(**collected_step_episodes, n_episodes_to_store=self.n_warmap_episodes)
-        self._update_normalizer(**collected_step_episodes)
 
 
 def make_env(config):

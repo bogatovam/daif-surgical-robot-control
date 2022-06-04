@@ -2,5 +2,5 @@ device_id: cpu
 render_mode: none
 
 hparams:
-  memory_capacity: 50000
-  batch_size: 512
+  memory_capacity: 128000
+  batch_size: 1024
